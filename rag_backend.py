@@ -1,6 +1,3 @@
-# ============================
-# rag_backend.py (ajustado para Streamlit Cloud)
-# ============================
 import os
 import re
 import warnings
@@ -13,15 +10,15 @@ from transformers import pipeline
 
 warnings.filterwarnings("ignore")
 
-# ----------------------------
-# 1. RUTAS RELATIVAS
-# ----------------------------
+# ============================
+# Rutas relativas (para GitHub / Streamlit Cloud)
+# ============================
 DATA_PATH = "Car_Reviews_español.xlsx"
 EMB_PATH = "car_reviews_embeddings.npy"
 
-# ----------------------------
-# 2. CARGA DE DATOS
-# ----------------------------
+# ============================
+# 1. Carga de datos
+# ============================
 if not os.path.exists(DATA_PATH):
     raise FileNotFoundError(
         f"No se encontró el archivo {DATA_PATH}. "
@@ -31,6 +28,7 @@ if not os.path.exists(DATA_PATH):
 df = pd.read_excel(DATA_PATH)
 df = df.dropna(subset=["review_es"])
 
+# armamos los textos base
 documents = [
     f"Vehículo: {row['Vehicle_Title']}. Comentario del usuario: {row['review_es']}. ¿Lo recomienda?: {row['Recommend']}."
     for _, row in df.iterrows()
@@ -38,17 +36,20 @@ documents = [
 
 print(f"✅ Dataset cargado: {len(df)} reseñas")
 
-# ----------------------------
-# 3. EMBEDDINGS
-# ----------------------------
+# ============================
+# 2. Modelo de embeddings
+# ============================
 print("Cargando modelo de SentenceTransformer - all-MiniLM-L6-v2 ...")
 embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 dimension = 384
 print("Modelo cargado ✅")
 
+# ============================
+# 3. Embeddings (cargar o generar)
+# ============================
 if os.path.exists(EMB_PATH):
-    print(f"Cargando embeddings desde disco: {EMB_PATH}")
     doc_embeddings = np.load(EMB_PATH)
+    print(f"Embeddings cargados desde {EMB_PATH}")
 else:
     print("Generando embeddings (primera vez)...")
     doc_embeddings = embedding_model.encode(documents, show_progress_bar=False)
@@ -57,21 +58,21 @@ else:
         np.save(EMB_PATH, doc_embeddings)
     except Exception:
         pass
-    print("✅ Embeddings generados")
+    print("✅ Embeddings generados y guardados")
 
 doc_embeddings = np.array(doc_embeddings, dtype="float32")
-print(f"Embeddings listos. Forma: {doc_embeddings.shape}")
+print(f"Forma de los embeddings: {doc_embeddings.shape}")
 
-# ----------------------------
+# ============================
 # 4. FAISS
-# ----------------------------
+# ============================
 index = faiss.IndexFlatL2(dimension)
 index.add(doc_embeddings)
 print(f"Índice FAISS creado con {index.ntotal} vectores.")
 
-# ----------------------------
-# 5. MODELO GENERATIVO
-# ----------------------------
+# ============================
+# 5. Modelo generativo (lo mantenemos como opcional)
+# ============================
 print("Cargando modelo generativo (GPT-2 español)...")
 generator = pipeline(
     task="text-generation",
@@ -80,9 +81,9 @@ generator = pipeline(
 )
 print("Modelo generativo cargado ✅")
 
-# ----------------------------
-# 6. LISTAS / EXPANSIONES
-# ----------------------------
+# ============================
+# 6. Listas / expansiones
+# ============================
 KNOWN_BRANDS = ["toyota", "ford", "hyundai", "kia", "honda", "chevrolet", "chevy"]
 KNOWN_MODELS = ["corolla", "transit", "cr-v", "crv", "tucson", "santa fe", "spin",
                 "edge", "rio", "soul", "veracruz", "element"]
@@ -104,18 +105,16 @@ ASPECT_EXPANSIONS = {
     "espacio": ["espacio", "carga", "maletero", "baúl", "baul"],
 }
 
-# ----------------------------
-# 7. HELPERS
-# ----------------------------
+# ============================
+# 7. Helpers
+# ============================
 def expand_query(query: str) -> str:
     q = query.lower()
     extra = []
     for key, vals in QUERY_EXPANSIONS.items():
         if key in q:
             extra.extend(vals)
-    if extra:
-        return query + " " + " ".join(extra)
-    return query
+    return query + " " + " ".join(extra) if extra else query
 
 def has_query_year(query: str) -> str | None:
     m = re.search(r"\b(19|20)\d{2}\b", query)
@@ -140,8 +139,7 @@ def filter_docs_by_aspect(retrieved_docs: list[str], query: str) -> list[str]:
     for doc in retrieved_docs:
         sentences = re.split(r"[\.!?]\s+", doc)
         for sent in sentences:
-            s_low = sent.lower()
-            if any(term in s_low for term in aspect_terms):
+            if any(term in sent.lower() for term in aspect_terms):
                 filtered_chunks.append(sent.strip() + ".")
     return filtered_chunks or retrieved_docs
 
@@ -153,24 +151,15 @@ def extract_years_from_docs(docs: list[str]) -> list[str]:
             years.add(y)
     return sorted(list(years))
 
-def extractive_answer(query: str, retrieved_docs: list) -> str:
-    aspect_docs = filter_docs_by_aspect(retrieved_docs, query)
-    if not aspect_docs:
-        return "No tengo información suficiente para responder a esa pregunta."
-    bullets = []
-    for i, doc in enumerate(aspect_docs, start=1):
-        bullets.append(f"- {doc.strip()} [{i}]")
-    return "Lo que dicen los usuarios es:\n" + "\n".join(bullets)
-
-# ----------------------------
-# 8. RECUPERACIÓN
-# ----------------------------
+# ============================
+# 8. Recuperación
+# ============================
 def retrieve_documents(query: str, k: int = 2):
     q_low = query.lower()
     brands_in_query = [b for b in KNOWN_BRANDS if b in q_low]
     models_in_query = [m for m in KNOWN_MODELS if m in q_low]
 
-    # filtro por marca/modelo si la query lo trae
+    # filtrado por marca / modelo
     if brands_in_query or models_in_query:
         mask = pd.Series([True] * len(df))
         if brands_in_query:
@@ -187,8 +176,8 @@ def retrieve_documents(query: str, k: int = 2):
             expanded_query = expand_query(query)
             q_emb = embedding_model.encode([expanded_query])
             q_emb = np.array(q_emb, dtype="float32")
-
             dists, idxs = sub_index.search(q_emb, min(k, len(sub_indices)))
+
             retrieved = []
             for pos in idxs[0]:
                 real_idx = sub_indices[pos]
@@ -202,26 +191,80 @@ def retrieve_documents(query: str, k: int = 2):
     dists, idxs = index.search(q_emb, k)
     return [documents[i] for i in idxs[0]]
 
-# ----------------------------
-# 9. GENERACIÓN (ajustada)
-# ----------------------------
-def generate_answer(query: str, retrieved_docs: list):
+# ============================
+# 9. Redactor "humano" sin LLM
+# ============================
+def build_human_answer(query: str, docs: list[str]) -> str:
     """
-    Intentamos usar el modelo generativo.
-    Si falla o devuelve algo muy corto, usamos la respuesta extractiva.
+    Construye una respuesta legible a partir de las reseñas recuperadas.
+    No usa el modelo generativo, solo las reseñas.
     """
-    # 1) si no hay docs, no inventamos
+    aspect_terms = get_aspect_terms(query)
+    comentarios = []
+    vehiculos = set()
+    positivos = 0
+    negativos = 0
+
+    for d in docs:
+        # vehículo
+        if d.startswith("Vehículo:"):
+            parte_vehiculo = d.split("Comentario del usuario:")[0]
+            vehiculos.add(parte_vehiculo.replace("Vehículo:", "").strip().strip("."))
+
+        # comentario
+        if "Comentario del usuario:" in d:
+            com = d.split("Comentario del usuario:")[1]
+            com = com.split("¿Lo recomienda?")[0].strip()
+        else:
+            com = d.strip()
+        comentarios.append(com)
+
+        # recomendación
+        if "¿Lo recomienda?: Si" in d or "¿Lo recomienda?: Sí" in d:
+            positivos += 1
+        elif "¿Lo recomienda?: No" in d:
+            negativos += 1
+
+    # filtramos por aspecto si corresponde
+    if aspect_terms:
+        comentarios = [c for c in comentarios if any(t in c.lower() for t in aspect_terms)] or comentarios
+
+    # armamos texto
+    resp = "Esto es lo que dicen las reseñas que encontré sobre eso:\n\n"
+
+    if vehiculos:
+        resp += "Modelos de los que hay opiniones: " + ", ".join(vehiculos) + ".\n"
+
+    if positivos or negativos:
+        total = positivos + negativos
+        resp += f"De {total} opiniones, {positivos} son positivas y {negativos} son negativas.\n"
+
+    resp += "\nPrincipales comentarios:\n"
+    for c in comentarios[:3]:
+        resp += f"- {c}\n"
+
+    return resp.strip()
+
+# ============================
+# 10. Generación híbrida
+# ============================
+def generate_answer(query: str, retrieved_docs: list[str]) -> str:
+    """
+    1. Intentamos con el modelo generativo.
+    2. Si la salida parece rara / repetitiva / demasiado corta, usamos la redacción propia.
+    """
     if not retrieved_docs:
         return "No tengo información suficiente para responder a esa pregunta."
 
-    # 2) armamos contexto
+    # primero intentamos que el modelo haga algo
     max_chars = 1200
-    retrieved_docs = [str(doc)[:max_chars] for doc in retrieved_docs]
-    context = "\n\n".join(f"[{i+1}] {doc}" for i, doc in enumerate(retrieved_docs))
+    short_docs = [str(doc)[:max_chars] for doc in retrieved_docs]
+    context = "\n\n".join(f"[{i+1}] {doc}" for i, doc in enumerate(short_docs))
 
     prompt = (
         "Tienes opiniones de usuarios sobre vehículos (en español).\n"
-        "Responde a la pregunta usando SOLO esas opiniones.\n"
+        "Resume lo que dicen los usuarios sobre el tema consultado, de manera clara y corta.\n"
+        "No repitas el texto exacto de las opiniones, sintetiza.\n"
         "Si no hay información suficiente, responde exactamente:\n"
         "\"No tengo información suficiente para responder a esa pregunta.\"\n\n"
         f"Opiniones:\n{context}\n\n"
@@ -229,49 +272,39 @@ def generate_answer(query: str, retrieved_docs: list):
         "Respuesta:"
     )
 
+    model_text = ""
     try:
-        generated = generator(
+        out = generator(
             prompt,
             max_new_tokens=200,
             num_return_sequences=1,
-            temperature=0.3,
-            top_p=0.95,
-            top_k=50,
+            temperature=0.4,
+            top_p=0.9,
             return_full_text=False,
         )
-        raw_answer = generated[0]["generated_text"]
+        model_text = out[0]["generated_text"]
+        # limpieza mínima
+        for token in ["Pregunta:", "Opiniones:", "Contexto:"]:
+            if token in model_text:
+                model_text = model_text.split(token)[0]
+        model_text = " ".join(line.strip() for line in model_text.splitlines() if line.strip())
     except Exception:
-        # en cloud puede fallar descargar o cargar el modelo
-        return extractive_answer(query, retrieved_docs)
+        model_text = ""
 
-    # limpieza básica
-    for token in ["Pregunta:", "Opiniones:", "Contexto:"]:
-        if token in raw_answer:
-            raw_answer = raw_answer.split(token)[0]
+    # criterio de “esto sirve”
+    if model_text and len(model_text.split()) > 18 and not model_text.lower().startswith("comentario del usuario"):
+        return model_text.strip()
 
-    cleaned = " ".join(line.strip() for line in raw_answer.splitlines() if line.strip())
+    # si NO sirve lo del modelo, lo hacemos nosotros
+    return build_human_answer(query, retrieved_docs)
 
-    # si quedó demasiado corto, volvemos al extractivo
-    if not cleaned or len(cleaned.split()) < 8:
-        return extractive_answer(query, retrieved_docs)
-
-    # si el modelo repite el prompt, también volvemos al extractivo
-    bad_starts = [
-        "tienes opiniones de usuarios",
-        "no tengo información suficiente",
-    ]
-    if any(cleaned.lower().startswith(b) for b in bad_starts):
-        return extractive_answer(query, retrieved_docs)
-
-    return cleaned
-
-# ----------------------------
-# 10. PIPELINE
-# ----------------------------
+# ============================
+# 11. Pipeline
+# ============================
 def answer_pipeline(query: str) -> str:
     docs = retrieve_documents(query, k=3)
 
-    # si pide un año que no está
+    # si pidió un año que no está, decimos qué años hay
     year = has_query_year(query)
     ctx = "\n\n".join(docs)
     if year and not context_has_year(ctx, year):
@@ -279,19 +312,13 @@ def answer_pipeline(query: str) -> str:
         if yrs:
             return (
                 f"No encuentro reseñas del {year} en los documentos recuperados.\n"
-                f"Pero sí tengo reseñas de estos años: {', '.join(yrs)}.\n"
-                "¿Sobre cuál de esos años querés saber más?"
+                f"Pero sí hay opiniones de estos años: {', '.join(yrs)}.\n"
+                "¿Querés que te cuente sobre alguno de esos?"
             )
         else:
             return (
                 f"No encuentro reseñas del {year} en los documentos recuperados. "
-                "Solo hay comentarios de otros años/modelos."
+                "Solo hay comentarios de otros años o modelos."
             )
 
-    aspect_docs = filter_docs_by_aspect(docs, query)
-    return generate_answer(query, aspect_docs)
-
-
-
-
-
+    return generate_answer(query, docs)
