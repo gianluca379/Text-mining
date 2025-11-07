@@ -4,6 +4,7 @@ import warnings
 import numpy as np
 import pandas as pd
 import faiss
+from sentence_transformers import SentenceTransformer
 
 warnings.filterwarnings("ignore")
 
@@ -24,23 +25,18 @@ if not os.path.exists(DATA_PATH):
 df = pd.read_excel(DATA_PATH)
 df = df.dropna(subset=["review_es"])
 
-# string base de cada fila
 documents = [
     f"Vehículo: {row['Vehicle_Title']}. Comentario del usuario: {row['review_es']}. ¿Lo recomienda?: {row['Recommend']}."
     for _, row in df.iterrows()
 ]
 
-# para detectar tokens de modelo
 ALL_TITLES_LOW = df["Vehicle_Title"].str.lower()
 
 print(f"✅ Dataset cargado: {len(df)} reseñas")
 
-
 # =====================================================
 # 3. EMBEDDINGS + FAISS
 # =====================================================
-from sentence_transformers import SentenceTransformer
-
 print("Cargando modelo de SentenceTransformer - all-MiniLM-L6-v2 ...")
 embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 dim = 384
@@ -76,7 +72,6 @@ STOP_TOKENS = {
     "una", "un", "al", "en", "para", "por", "con", "lo"
 }
 
-# expansión para buscar en FAISS
 QUERY_EXPANSIONS = {
     "caja automática": ["transmisión", "transmision", "caja", "automatic"],
     "consumo": [
@@ -87,7 +82,6 @@ QUERY_EXPANSIONS = {
     "ruido": ["ruido", "ruidoso", "cabina ruidosa", "sound", "noise"],
 }
 
-# expansión para filtrar frases
 ASPECT_EXPANSIONS = {
     "consumo": [
         "consumo", "combustible", "consumo de combustible",
@@ -131,18 +125,31 @@ def get_aspect_terms(query: str):
     return list(terms)
 
 
+def rerank_by_aspect(docs: list[str], query: str) -> list[str]:
+    """Reordena los docs poniendo arriba los que más mencionan el aspecto."""
+    aspect_terms = get_aspect_terms(query)
+    if not aspect_terms:
+        return docs
+
+    scored = []
+    for d in docs:
+        text_low = d.lower()
+        score = sum(text_low.count(term) for term in aspect_terms)
+        scored.append((score, d))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    if scored[0][0] == 0:
+        return [d for _, d in scored]
+    return [d for _, d in scored]
+
+
 def filter_docs_by_aspect(retrieved_docs: list[str], query: str) -> list[str]:
-    """
-    Filtra por aspecto pero NO deja vacío: si no encuentra frases del aspecto,
-    devuelve los docs originales.
-    """
     aspect_terms = get_aspect_terms(query)
     if not aspect_terms:
         return retrieved_docs
 
     filtered = []
     for doc in retrieved_docs:
-        # lo corto en frases
         sentences = re.split(r"[\.!?]\s+", doc)
         for sent in sentences:
             if any(term in sent.lower() for term in aspect_terms):
@@ -166,10 +173,8 @@ def extract_years_from_docs(docs: list[str]) -> list[str]:
 def retrieve_documents(query: str, k: int = 3):
     q_low = query.lower()
     tokens = [clean_token(t) for t in q_low.split() if clean_token(t)]
-
     brands_in_query = [b for b in KNOWN_BRANDS if b in q_low]
 
-    # tokens de modelo que realmente existen en Vehicle_Title
     model_like_tokens = []
     for t in tokens:
         if t in STOP_TOKENS or t in KNOWN_BRANDS:
@@ -177,7 +182,6 @@ def retrieve_documents(query: str, k: int = 3):
         if ALL_TITLES_LOW.str.contains(t).any():
             model_like_tokens.append(t)
 
-    # 1) marca + token que existe en títulos
     if brands_in_query and model_like_tokens:
         mask = pd.Series([True] * len(df))
         mask &= df["Vehicle_Title"].str.lower().str.contains("|".join(brands_in_query))
@@ -192,7 +196,6 @@ def retrieve_documents(query: str, k: int = 3):
                 for _, row in df_sub.head(k).iterrows()
             ]
 
-    # 2) solo marca → busco dentro de esa marca con embeddings
     if brands_in_query:
         mask = df["Vehicle_Title"].str.lower().str.contains("|".join(brands_in_query))
         df_sub = df[mask]
@@ -211,7 +214,6 @@ def retrieve_documents(query: str, k: int = 3):
             dists, idxs = sub_index.search(q_emb, min(k, len(sub_docs)))
             return [sub_docs[i] for i in idxs[0]]
 
-    # 3) fallback global
     expanded_query = expand_query(query)
     q_emb = np.array(embedding_model.encode([expanded_query]), dtype="float32")
     dists, idxs = index.search(q_emb, k)
@@ -219,7 +221,7 @@ def retrieve_documents(query: str, k: int = 3):
 
 
 # =====================================================
-# 7. CONSTRUCTOR DE RESPUESTA (SIN GPT-2)
+# 7. CONSTRUCTOR DE RESPUESTA
 # =====================================================
 def build_human_answer(query: str, docs: list[str]) -> str:
     aspect_terms = get_aspect_terms(query)
@@ -233,7 +235,6 @@ def build_human_answer(query: str, docs: list[str]) -> str:
             vh = d.split("Comentario del usuario:")[0]
             vh = vh.replace("Vehículo:", "").strip().strip(".")
             vehiculos.add(vh)
-        # comentario
         if "Comentario del usuario:" in d:
             com = d.split("Comentario del usuario:")[1]
             com = com.split("¿Lo recomienda?")[0].strip()
@@ -246,7 +247,6 @@ def build_human_answer(query: str, docs: list[str]) -> str:
         elif "¿Lo recomienda?: No" in d:
             neg += 1
 
-    # filtrado por aspecto (sin dejar vacío)
     if aspect_terms:
         comentarios_aspecto = [
             c for c in comentarios if any(t in c.lower() for t in aspect_terms)
@@ -275,8 +275,8 @@ def build_human_answer(query: str, docs: list[str]) -> str:
 # =====================================================
 def answer_pipeline(query: str) -> str:
     docs = retrieve_documents(query, k=4)
+    docs = rerank_by_aspect(docs, query)
 
-    # manejo de año como antes
     year = has_query_year(query)
     ctx = "\n\n".join(docs)
     if year and not context_has_year(ctx, year):
@@ -293,13 +293,9 @@ def answer_pipeline(query: str) -> str:
                 "Solo hay comentarios de otros años o modelos."
             )
 
-    # filtramos por aspecto y devolvemos extractivo
     aspect_docs = filter_docs_by_aspect(docs, query)
     return build_human_answer(query, aspect_docs)
 
 
-# pequeño helper para Streamlit (mostrar docs recuperados)
 def retrieve_for_ui(query: str, k: int = 4):
     return retrieve_documents(query, k)
-
-
