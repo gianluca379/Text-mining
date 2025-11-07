@@ -104,9 +104,7 @@ ASPECT_EXPANSIONS = {
     "espacio": ["espacio", "carga", "maletero", "baúl", "baul"],
 }
 
-# algunas palabras de “relleno” que no queremos tomar como modelo
 STOP_TOKENS = {"la", "el", "de", "del", "los", "las", "y", "sobre", "que", "una", "un", "al", "en"}
-
 
 # ============================
 # 8. FUNCIONES AUXILIARES
@@ -119,15 +117,12 @@ def expand_query(query: str) -> str:
             extra.extend(vals)
     return query + " " + " ".join(extra) if extra else query
 
-
 def has_query_year(query: str) -> str | None:
     m = re.search(r"\b(19|20)\d{2}\b", query)
     return m.group(0) if m else None
 
-
 def context_has_year(context: str, year: str) -> bool:
     return year in context
-
 
 def get_aspect_terms(query: str):
     q = query.lower()
@@ -136,7 +131,6 @@ def get_aspect_terms(query: str):
         if key in q:
             terms.update(vals)
     return list(terms)
-
 
 def filter_docs_by_aspect(retrieved_docs: list[str], query: str) -> list[str]:
     aspect_terms = get_aspect_terms(query)
@@ -150,7 +144,6 @@ def filter_docs_by_aspect(retrieved_docs: list[str], query: str) -> list[str]:
                 filtered_chunks.append(sent.strip() + ".")
     return filtered_chunks or retrieved_docs
 
-
 def extract_years_from_docs(docs: list[str]) -> list[str]:
     years = set()
     for d in docs:
@@ -159,9 +152,8 @@ def extract_years_from_docs(docs: list[str]) -> list[str]:
             years.add(y)
     return sorted(list(years))
 
-
 # ============================
-# 9. RETRIEVAL (ajustado para “ford aspire”)
+# 9. RETRIEVAL (ajustado correctamente)
 # ============================
 def retrieve_documents(query: str, k: int = 3):
     q_low = query.lower()
@@ -170,8 +162,6 @@ def retrieve_documents(query: str, k: int = 3):
     brands_in_query = [b for b in KNOWN_BRANDS if b in q_low]
     models_in_query = [m for m in KNOWN_MODELS if m in q_low]
 
-    # candidatos a “modelo libre” que vienen después de la marca
-    # ej: "ford aspire" -> aspire
     candidate_tokens = [
         t for t in tokens
         if t not in STOP_TOKENS
@@ -179,66 +169,72 @@ def retrieve_documents(query: str, k: int = 3):
         and t not in KNOWN_MODELS
     ]
 
-    # 1) si hay una marca y hay algún token candidato (aspire, fiesta, ranger…), probamos
-    #    filtrar directo el Excel por ese token
+    # 1️⃣ Marca + token candidato (ej: ford aspire)
     if brands_in_query and candidate_tokens:
         mask = pd.Series([True] * len(df))
-        # todas las marcas que mencionó
-        mask = mask & df["Vehicle_Title"].str.lower().str.contains("|".join(brands_in_query))
-        # todos los tokens “libres” que mencionó
+        mask &= df["Vehicle_Title"].str.lower().str.contains("|".join(brands_in_query))
         for tok in candidate_tokens:
-            mask = mask & df["Vehicle_Title"].str.lower().str.contains(tok)
+            tok_mask = (
+                df["Vehicle_Title"].str.lower().str.contains(tok)
+                | df["review_es"].str.lower().str.contains(tok)
+            )
+            mask &= tok_mask
+
         df_sub = df[mask]
         if not df_sub.empty:
-            sub_indices = df_sub.index.to_list()
-            sub_embeddings = doc_embeddings[sub_indices]
+            df_sub = df_sub.reset_index(drop=True)
+            sub_docs = [
+                f"Vehículo: {row['Vehicle_Title']}. Comentario del usuario: {row['review_es']}. ¿Lo recomienda?: {row['Recommend']}."
+                for _, row in df_sub.iterrows()
+            ]
+            sub_emb = embedding_model.encode(sub_docs, show_progress_bar=False)
+            sub_emb = np.array(sub_emb, dtype="float32")
+
             sub_index = faiss.IndexFlatL2(dimension)
-            sub_index.add(sub_embeddings)
+            sub_index.add(sub_emb)
 
             expanded_query = expand_query(query)
-            q_emb = embedding_model.encode([expanded_query])
-            q_emb = np.array(q_emb, dtype="float32")
-            dists, idxs = sub_index.search(q_emb, min(k, len(sub_indices)))
+            q_emb = np.array(embedding_model.encode([expanded_query]), dtype="float32")
+            dists, idxs = sub_index.search(q_emb, min(k, len(df_sub)))
 
-            retrieved = []
-            for pos in idxs[0]:
-                real_idx = sub_indices[pos]
-                retrieved.append(documents[real_idx])
-            return retrieved
-        # si no encontró nada así, seguimos con la lógica de siempre
+            retrieved = [sub_docs[i] for i in idxs[0]]
 
-    # 2) lógica original: si reconocimos marca y/o modelo de los que sabemos, filtramos por eso
+            # 🔍 seguridad: si FAISS no devuelve el modelo correcto, filtramos manualmente
+            joined = " ".join(retrieved).lower()
+            if not any(tok in joined for tok in candidate_tokens):
+                retrieved = [d for d in sub_docs if any(tok in d.lower() for tok in candidate_tokens)]
+
+            return retrieved or sub_docs[:k]
+
+    # 2️⃣ Marca o modelo conocidos
     if brands_in_query or models_in_query:
         mask = pd.Series([True] * len(df))
         if brands_in_query:
-            mask = mask & df["Vehicle_Title"].str.lower().str.contains("|".join(brands_in_query))
+            mask &= df["Vehicle_Title"].str.lower().str.contains("|".join(brands_in_query))
         if models_in_query:
-            mask = mask & df["Vehicle_Title"].str.lower().str.contains("|".join(models_in_query))
+            mask &= df["Vehicle_Title"].str.lower().str.contains("|".join(models_in_query))
         df_sub = df[mask]
         if not df_sub.empty:
-            sub_indices = df_sub.index.to_list()
-            sub_embeddings = doc_embeddings[sub_indices]
+            df_sub = df_sub.reset_index(drop=True)
+            sub_docs = [
+                f"Vehículo: {row['Vehicle_Title']}. Comentario del usuario: {row['review_es']}. ¿Lo recomienda?: {row['Recommend']}."
+                for _, row in df_sub.iterrows()
+            ]
+            sub_emb = embedding_model.encode(sub_docs, show_progress_bar=False)
+            sub_emb = np.array(sub_emb, dtype="float32")
             sub_index = faiss.IndexFlatL2(dimension)
-            sub_index.add(sub_embeddings)
+            sub_index.add(sub_emb)
 
             expanded_query = expand_query(query)
-            q_emb = embedding_model.encode([expanded_query])
-            q_emb = np.array(q_emb, dtype="float32")
-            dists, idxs = sub_index.search(q_emb, min(k, len(sub_indices)))
+            q_emb = np.array(embedding_model.encode([expanded_query]), dtype="float32")
+            dists, idxs = sub_index.search(q_emb, min(k, len(df_sub)))
+            return [sub_docs[i] for i in idxs[0]]
 
-            retrieved = []
-            for pos in idxs[0]:
-                real_idx = sub_indices[pos]
-                retrieved.append(documents[real_idx])
-            return retrieved
-
-    # 3) si nada de lo anterior funcionó, búsqueda global
+    # 3️⃣ Búsqueda global de respaldo
     expanded_query = expand_query(query)
-    q_emb = embedding_model.encode([expanded_query])
-    q_emb = np.array(q_emb, dtype="float32")
+    q_emb = np.array(embedding_model.encode([expanded_query]), dtype="float32")
     dists, idxs = index.search(q_emb, k)
     return [documents[i] for i in idxs[0]]
-
 
 # ============================
 # 10. REDACTOR HUMANO
@@ -280,9 +276,8 @@ def build_human_answer(query: str, docs: list[str]) -> str:
 
     return resp.strip()
 
-
 # ============================
-# 11. GENERACIÓN HÍBRIDA (mejorada)
+# 11. GENERACIÓN HÍBRIDA
 # ============================
 def generate_answer(query: str, retrieved_docs: list[str]) -> str:
     if not retrieved_docs:
@@ -329,14 +324,11 @@ def generate_answer(query: str, retrieved_docs: list[str]) -> str:
 
     return model_text.strip()
 
-
 # ============================
 # 12. PIPELINE FINAL
 # ============================
 def answer_pipeline(query: str) -> str:
     docs = retrieve_documents(query, k=3)
-
-    # lógica de año igual que antes
     year = has_query_year(query)
     ctx = "\n\n".join(docs)
     if year and not context_has_year(ctx, year):
@@ -354,5 +346,6 @@ def answer_pipeline(query: str) -> str:
             )
 
     return generate_answer(query, docs)
+
 
 
