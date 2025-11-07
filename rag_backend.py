@@ -33,7 +33,7 @@ documents = [
     for _, row in df.iterrows()
 ]
 
-# lo uso para saber rápido si un token existe en algún título
+# para chequear si un token existe en algún título
 ALL_TITLES_LOW = df["Vehicle_Title"].str.lower()
 
 print(f"✅ Dataset cargado: {len(df)} reseñas")
@@ -113,7 +113,6 @@ ASPECT_EXPANSIONS = {
 # 7. HELPERS
 # ============================
 def clean_token(t: str) -> str:
-    # saca ¿ ? ! . , ; :
     return re.sub(r'^[\?\!\.\,\;\:\¿\¡]+|[\?\!\.\,\;\:\¿\¡]+$', '', t)
 
 def expand_query(query: str) -> str:
@@ -163,20 +162,13 @@ def extract_years_from_docs(docs: list[str]) -> list[str]:
 # 8. RETRIEVAL
 # ============================
 def retrieve_documents(query: str, k: int = 3):
-    """
-    - si hay marca en la pregunta (ford) y además alguna palabra de la pregunta
-      aparece en algún Vehicle_Title, filtramos por marca + esas palabras
-      (esto captura "ford aspire")
-    - si solo hay marca, filtramos por marca
-    - si no, FAISS global
-    """
     q_low = query.lower()
     raw_tokens = [t for t in re.split(r"\s+", q_low) if t]
     tokens = [clean_token(t) for t in raw_tokens if clean_token(t)]
 
     brands_in_query = [b for b in KNOWN_BRANDS if b in q_low]
 
-    # tokens de la pregunta que de verdad existen en títulos (aspire, connect, cr-v...)
+    # tokens de la pregunta que de verdad existen en títulos
     model_like_tokens = []
     for t in tokens:
         if t in STOP_TOKENS:
@@ -186,7 +178,7 @@ def retrieve_documents(query: str, k: int = 3):
         if ALL_TITLES_LOW.str.contains(t).any():
             model_like_tokens.append(t)
 
-    # 1) marca + token existente en títulos
+    # 1) marca + token existente en títulos (ej. ford + aspire)
     if brands_in_query and model_like_tokens:
         mask = pd.Series([True] * len(df))
         mask &= df["Vehicle_Title"].str.lower().str.contains("|".join(brands_in_query))
@@ -212,7 +204,7 @@ def retrieve_documents(query: str, k: int = 3):
                 f"Vehículo: {row['Vehicle_Title']}. Comentario del usuario: {row['review_es']}. ¿Lo recomienda?: {row['Recommend']}."
                 for _, row in df_sub.iterrows()
             ]
-            # faiss dentro del subset para quedarnos con los más parecidos
+            # faiss dentro del subset
             sub_emb = embedding_model.encode(sub_docs, show_progress_bar=False)
             sub_emb = np.array(sub_emb, dtype="float32")
             sub_index = faiss.IndexFlatL2(dimension)
@@ -321,10 +313,10 @@ def generate_answer(query: str, retrieved_docs: list[str]) -> str:
 # 11. PIPELINE FINAL
 # ============================
 def answer_pipeline(query: str) -> str:
-    # 1) recuperamos como siempre (3 docs)
+    # recuperar 3
     docs = retrieve_documents(query, k=3)
 
-    # 2) intentamos detectar el modelo exacto del primer doc
+    # detectar modelo exacto
     modelo_detectado = None
     if docs:
         first = docs[0]
@@ -332,9 +324,8 @@ def answer_pipeline(query: str) -> str:
             modelo_detectado = first.split("Comentario del usuario:")[0]
             modelo_detectado = modelo_detectado.replace("Vehículo:", "").strip().lower()
 
-    # 3) si detectamos modelo, traemos TODAS las filas de ese modelo
+    # si hay modelo exacto -> traigo todas las reseñas de ese modelo
     if modelo_detectado:
-        # escapamos por las dudas (si hay parentesis, etc.)
         mask_all = df["Vehicle_Title"].str.lower().str.contains(re.escape(modelo_detectado))
         df_all = df[mask_all]
         if not df_all.empty:
@@ -342,9 +333,11 @@ def answer_pipeline(query: str) -> str:
                 f"Vehículo: {row['Vehicle_Title']}. Comentario del usuario: {row['review_es']}. ¿Lo recomienda?: {row['Recommend']}."
                 for _, row in df_all.iterrows()
             ]
-            return generate_answer(query, all_docs_same_model)
+            # 👇 acá volvemos a filtrar por aspecto para que "motor", "espacio", etc. funcionen
+            aspect_docs = filter_docs_by_aspect(all_docs_same_model, query)
+            return generate_answer(query, aspect_docs)
 
-    # 4) si no hubo modelo exacto, seguimos con la lógica de años
+    # manejo de años como antes
     year = has_query_year(query)
     ctx = "\n\n".join(docs)
     if year and not context_has_year(ctx, year):
@@ -361,8 +354,10 @@ def answer_pipeline(query: str) -> str:
                 "Solo hay comentarios de otros años o modelos."
             )
 
-    # 5) respuesta normal
-    return generate_answer(query, docs)
+    # 👇 y si no había modelo exacto, también filtramos por aspecto
+    aspect_docs = filter_docs_by_aspect(docs, query)
+    return generate_answer(query, aspect_docs)
+
 
 
 
