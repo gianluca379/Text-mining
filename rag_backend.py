@@ -33,7 +33,7 @@ documents = [
     for _, row in df.iterrows()
 ]
 
-# para chequear si un token existe en algún título
+# para saber si un token existe en algún título
 ALL_TITLES_LOW = df["Vehicle_Title"].str.lower()
 
 print(f"✅ Dataset cargado: {len(df)} reseñas")
@@ -84,22 +84,22 @@ print("Modelo generativo cargado ✅")
 # 6. CONSTANTES
 # ============================
 KNOWN_BRANDS = ["toyota", "ford", "hyundai", "kia", "honda", "chevrolet", "chevy"]
-KNOWN_MODELS = ["corolla", "transit", "cr-v", "crv", "tucson", "santa fe", "spin",
-                "edge", "rio", "soul", "veracruz", "element"]
 
 STOP_TOKENS = {
     "la", "el", "de", "del", "los", "las", "y", "sobre", "que",
-    "una", "un", "al", "en", "para", "por", "con", "lo", "los", "las"
+    "una", "un", "al", "en", "para", "por", "con", "lo"
 }
 
 QUERY_EXPANSIONS = {
     "caja automática": ["transmisión", "transmision", "caja", "automatic"],
-    "consumo": ["consumo", "mpg", "gasolina", "rendimiento de gasolina", "economía de combustible"],
+    "consumo": ["consumo", "mpg", "gasolina", "rendimiento de gasolina",
+                "economía de combustible", "economia de combustible", "kilometraje", "millas", "km"],
     "ruido": ["ruido", "ruidoso", "cabina ruidosa", "sound", "noise"],
 }
 
 ASPECT_EXPANSIONS = {
-    "consumo": ["consumo", "gasolina", "rendimiento", "mpg", "fuel", "economía", "economia"],
+    "consumo": ["consumo", "gasolina", "rendimiento", "mpg", "fuel",
+                "economía", "economia", "kilometraje", "millas", "km"],
     "ruido": ["ruido", "ruidoso", "sonido", "cabina ruidosa"],
     "transmisión": ["transmisión", "transmision", "caja", "caja automática", "automatic"],
     "suspensión": ["suspensión", "suspension"],
@@ -138,17 +138,26 @@ def get_aspect_terms(query: str):
             terms.update(vals)
     return list(terms)
 
-def filter_docs_by_aspect(retrieved_docs: list[str], query: str) -> list[str]:
+def filter_docs_by_aspect(retrieved_docs: list[str], query: str, strict: bool = False) -> list[str]:
+    """
+    strict=True => si no hay ninguna frase del aspecto, devolvemos lista vacía.
+    strict=False => si no hay coincidencias, devolvemos los docs originales.
+    """
     aspect_terms = get_aspect_terms(query)
     if not aspect_terms:
         return retrieved_docs
+
     filtered_chunks = []
     for doc in retrieved_docs:
         sentences = re.split(r"[\.!?]\s+", doc)
         for sent in sentences:
             if any(term in sent.lower() for term in aspect_terms):
                 filtered_chunks.append(sent.strip() + ".")
-    return filtered_chunks or retrieved_docs
+
+    if not filtered_chunks:
+        return [] if strict else retrieved_docs
+
+    return filtered_chunks
 
 def extract_years_from_docs(docs: list[str]) -> list[str]:
     years = set()
@@ -247,7 +256,10 @@ def build_human_answer(query: str, docs: list[str]) -> str:
             negativos += 1
 
     if aspect_terms:
-        comentarios = [c for c in comentarios if any(t in c.lower() for t in aspect_terms)] or comentarios
+        comentarios = [c for c in comentarios if any(t in c.lower() for t in aspect_terms)]
+
+    if not comentarios:
+        return "No tengo información suficiente para responder a esa pregunta."
 
     resp = "Esto es lo que dicen las reseñas encontradas:\n\n"
     if vehiculos:
@@ -313,18 +325,20 @@ def generate_answer(query: str, retrieved_docs: list[str]) -> str:
 # 11. PIPELINE FINAL
 # ============================
 def answer_pipeline(query: str) -> str:
-    # recuperar 3
+    # recuperar algunos docs
     docs = retrieve_documents(query, k=3)
 
-    # detectar modelo exacto
+    # detectar modelo exacto del primer doc
     modelo_detectado = None
-    if docs:
-        first = docs[0]
-        if first.startswith("Vehículo:"):
-            modelo_detectado = first.split("Comentario del usuario:")[0]
-            modelo_detectado = modelo_detectado.replace("Vehículo:", "").strip().lower()
+    if docs and docs[0].startswith("Vehículo:"):
+        modelo_detectado = (
+            docs[0].split("Comentario del usuario:")[0]
+            .replace("Vehículo:", "")
+            .strip()
+            .lower()
+        )
 
-    # si hay modelo exacto -> traigo todas las reseñas de ese modelo
+    # si hay modelo exacto, traigo TODAS las reseñas de ese modelo
     if modelo_detectado:
         mask_all = df["Vehicle_Title"].str.lower().str.contains(re.escape(modelo_detectado))
         df_all = df[mask_all]
@@ -333,11 +347,13 @@ def answer_pipeline(query: str) -> str:
                 f"Vehículo: {row['Vehicle_Title']}. Comentario del usuario: {row['review_es']}. ¿Lo recomienda?: {row['Recommend']}."
                 for _, row in df_all.iterrows()
             ]
-            # 👇 acá volvemos a filtrar por aspecto para que "motor", "espacio", etc. funcionen
-            aspect_docs = filter_docs_by_aspect(all_docs_same_model, query)
+            # 👇 ahora sí: filtrado estricto por aspecto
+            aspect_docs = filter_docs_by_aspect(all_docs_same_model, query, strict=True)
+            if not aspect_docs:
+                return "No tengo información suficiente para responder a esa pregunta."
             return generate_answer(query, aspect_docs)
 
-    # manejo de años como antes
+    # manejo de años
     year = has_query_year(query)
     ctx = "\n\n".join(docs)
     if year and not context_has_year(ctx, year):
@@ -354,9 +370,12 @@ def answer_pipeline(query: str) -> str:
                 "Solo hay comentarios de otros años o modelos."
             )
 
-    # 👇 y si no había modelo exacto, también filtramos por aspecto
-    aspect_docs = filter_docs_by_aspect(docs, query)
+    # caso general: también filtramos estricto
+    aspect_docs = filter_docs_by_aspect(docs, query, strict=True)
+    if not aspect_docs:
+        return "No tengo información suficiente para responder a esa pregunta."
     return generate_answer(query, aspect_docs)
+
 
 
 
