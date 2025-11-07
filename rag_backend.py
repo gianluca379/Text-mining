@@ -93,13 +93,18 @@ STOP_TOKENS = {
 QUERY_EXPANSIONS = {
     "caja automática": ["transmisión", "transmision", "caja", "automatic"],
     "consumo": ["consumo", "mpg", "gasolina", "rendimiento de gasolina",
-                "economía de combustible", "economia de combustible", "kilometraje", "millas", "km"],
+                "economía de combustible", "economia de combustible",
+                "consumo de combustible", "combustible", "kilometraje", "millas", "km"],
     "ruido": ["ruido", "ruidoso", "cabina ruidosa", "sound", "noise"],
 }
 
 ASPECT_EXPANSIONS = {
-    "consumo": ["consumo", "gasolina", "rendimiento", "mpg", "fuel",
-                "economía", "economia", "kilometraje", "millas", "km"],
+    # 👇 acá agrego "combustible" que te faltaba
+    "consumo": [
+        "consumo", "gasolina", "rendimiento", "mpg", "fuel",
+        "economía", "economia", "combustible", "consumo de combustible",
+        "economía de combustible", "kilometraje", "millas", "km"
+    ],
     "ruido": ["ruido", "ruidoso", "sonido", "cabina ruidosa"],
     "transmisión": ["transmisión", "transmision", "caja", "caja automática", "automatic"],
     "suspensión": ["suspensión", "suspension"],
@@ -138,7 +143,11 @@ def get_aspect_terms(query: str):
             terms.update(vals)
     return list(terms)
 
-def filter_docs_by_aspect(retrieved_docs: list[str], query: str, strict: bool = False) -> list[str]:
+def filter_docs_by_aspect(retrieved_docs: list[str], query: str) -> list[str]:
+    """
+    Filtro NO estricto: si hay frases del aspecto, uso solo esas.
+    Si no hay, devuelvo los docs originales (para que no quede vacío).
+    """
     aspect_terms = get_aspect_terms(query)
     if not aspect_terms:
         return retrieved_docs
@@ -150,10 +159,7 @@ def filter_docs_by_aspect(retrieved_docs: list[str], query: str, strict: bool = 
             if any(term in sent.lower() for term in aspect_terms):
                 filtered_chunks.append(sent.strip() + ".")
 
-    if not filtered_chunks:
-        return [] if strict else retrieved_docs
-
-    return filtered_chunks
+    return filtered_chunks or retrieved_docs
 
 def extract_years_from_docs(docs: list[str]) -> list[str]:
     years = set()
@@ -199,7 +205,7 @@ def retrieve_documents(query: str, k: int = 3):
             ]
             return sub_docs[:k]
 
-    # 2) solo marca
+    # 2) solo marca (pero reordeno con faiss)
     if brands_in_query:
         mask = df["Vehicle_Title"].str.lower().str.contains("|".join(brands_in_query))
         df_sub = df[mask]
@@ -209,7 +215,7 @@ def retrieve_documents(query: str, k: int = 3):
                 f"Vehículo: {row['Vehicle_Title']}. Comentario del usuario: {row['review_es']}. ¿Lo recomienda?: {row['Recommend']}."
                 for _, row in df_sub.iterrows()
             ]
-            # faiss dentro del subset
+
             sub_emb = embedding_model.encode(sub_docs, show_progress_bar=False)
             sub_emb = np.array(sub_emb, dtype="float32")
             sub_index = faiss.IndexFlatL2(dimension)
@@ -251,6 +257,7 @@ def build_human_answer(query: str, docs: list[str]) -> str:
         elif "¿Lo recomienda?: No" in d:
             negativos += 1
 
+    # intento filtrar por aspecto pero sin dejar vacío
     if aspect_terms:
         comentarios_aspecto = [c for c in comentarios if any(t in c.lower() for t in aspect_terms)]
         if comentarios_aspecto:
@@ -274,7 +281,7 @@ def build_human_answer(query: str, docs: list[str]) -> str:
 # ============================
 # 10. GENERACIÓN
 # ============================
-def generate_answer(query: str, retrieved_docs: list[str], note: str = "") -> str:
+def generate_answer(query: str, retrieved_docs: list[str]) -> str:
     if not retrieved_docs:
         return "No tengo información suficiente para responder a esa pregunta."
 
@@ -282,12 +289,7 @@ def generate_answer(query: str, retrieved_docs: list[str], note: str = "") -> st
     short_docs = [str(doc)[:max_chars] for doc in retrieved_docs]
     context = "\n\n".join(f"[{i+1}] {doc}" for i, doc in enumerate(short_docs))
 
-    prefix = ""
-    if note:
-        prefix = note + "\n\n"
-
     prompt = (
-        prefix +
         "Tienes opiniones de usuarios sobre vehículos (en español).\n"
         "Resume de manera natural y completa lo que dicen los usuarios sobre el tema consultado.\n"
         "No repitas el texto exacto, sintetiza y escribe una respuesta terminada con punto final.\n"
@@ -311,16 +313,14 @@ def generate_answer(query: str, retrieved_docs: list[str], note: str = "") -> st
     except Exception:
         model_text = ""
 
+    # si el modelo se pone a repetir el prompt, cae al modo humano
+    if ("Tienes opiniones de usuarios" in model_text) or (len(model_text.strip()) < 15):
+        return build_human_answer(query, retrieved_docs)
+
     for token in ["Pregunta:", "Opiniones:", "Contexto:"]:
         if token in model_text:
             model_text = model_text.split(token)[0]
     model_text = " ".join(line.strip() for line in model_text.splitlines() if line.strip())
-
-    truncated = not model_text.endswith((".", "?", "!", "”", "\"")) or len(model_text.split()) < 20
-    too_similar = "comentario del usuario" in model_text.lower()
-
-    if truncated or too_similar:
-        return build_human_answer(query, retrieved_docs)
 
     return model_text.strip()
 
@@ -328,10 +328,10 @@ def generate_answer(query: str, retrieved_docs: list[str], note: str = "") -> st
 # 11. PIPELINE FINAL
 # ============================
 def answer_pipeline(query: str) -> str:
-    # recuperar 3
+    # recuperar algo
     docs = retrieve_documents(query, k=3)
 
-    # detectar modelo exacto
+    # detectar modelo exacto del primer doc
     modelo_detectado = None
     if docs and docs[0].startswith("Vehículo:"):
         modelo_detectado = (
@@ -341,7 +341,7 @@ def answer_pipeline(query: str) -> str:
             .lower()
         )
 
-    # si hay modelo exacto, traigo todas las reseñas de ese modelo
+    # si hay modelo exacto, traigo TODAS las reseñas de ese modelo
     if modelo_detectado:
         mask_all = df["Vehicle_Title"].str.lower().str.contains(re.escape(modelo_detectado))
         df_all = df[mask_all]
@@ -350,18 +350,11 @@ def answer_pipeline(query: str) -> str:
                 f"Vehículo: {row['Vehicle_Title']}. Comentario del usuario: {row['review_es']}. ¿Lo recomienda?: {row['Recommend']}."
                 for _, row in df_all.iterrows()
             ]
-            # 1) intento filtro estricto
-            strict_docs = filter_docs_by_aspect(all_docs_same_model, query, strict=True)
-            if strict_docs:
-                return generate_answer(query, strict_docs)
-            # 2) fallback suave: te aviso
-            return generate_answer(
-                query,
-                all_docs_same_model,
-                note="No encontré reseñas que hablen específicamente de ese aspecto, pero esto es lo que comentan los usuarios sobre ese modelo."
-            )
+            # filtro NO estricto (si no hay consumo, no queda vacío)
+            aspect_docs = filter_docs_by_aspect(all_docs_same_model, query)
+            return generate_answer(query, aspect_docs)
 
-    # manejo de años
+    # manejo de años igual que antes
     year = has_query_year(query)
     ctx = "\n\n".join(docs)
     if year and not context_has_year(ctx, year):
@@ -378,16 +371,9 @@ def answer_pipeline(query: str) -> str:
                 "Solo hay comentarios de otros años o modelos."
             )
 
-    # caso general: intento estricto y luego suave
-    strict_docs = filter_docs_by_aspect(docs, query, strict=True)
-    if strict_docs:
-        return generate_answer(query, strict_docs)
-
-    return generate_answer(
-        query,
-        docs,
-        note="No encontré reseñas que hablen específicamente de ese aspecto, pero esto es lo que comentan los usuarios."
-    )
+    # caso general
+    aspect_docs = filter_docs_by_aspect(docs, query)
+    return generate_answer(query, aspect_docs)
 
 
 
