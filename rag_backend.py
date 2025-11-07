@@ -11,7 +11,7 @@ from transformers import pipeline
 warnings.filterwarnings("ignore")
 
 # ============================
-# 1. RUTAS RELATIVAS (para GitHub / Streamlit Cloud)
+# 1. RUTAS
 # ============================
 DATA_PATH = "Car_Reviews_español.xlsx"
 EMB_PATH = "car_reviews_embeddings.npy"
@@ -36,16 +36,13 @@ documents = [
 print(f"✅ Dataset cargado: {len(df)} reseñas")
 
 # ============================
-# 3. MODELO DE EMBEDDINGS
+# 3. EMBEDDINGS
 # ============================
 print("Cargando modelo de SentenceTransformer - all-MiniLM-L6-v2 ...")
 embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 dimension = 384
 print("Modelo cargado ✅")
 
-# ============================
-# 4. EMBEDDINGS (cargar o generar)
-# ============================
 if os.path.exists(EMB_PATH):
     doc_embeddings = np.load(EMB_PATH)
     print(f"Embeddings cargados desde {EMB_PATH}")
@@ -63,14 +60,14 @@ doc_embeddings = np.array(doc_embeddings, dtype="float32")
 print(f"Forma de los embeddings: {doc_embeddings.shape}")
 
 # ============================
-# 5. FAISS INDEX
+# 4. FAISS
 # ============================
 index = faiss.IndexFlatL2(dimension)
 index.add(doc_embeddings)
 print(f"Índice FAISS creado con {index.ntotal} vectores.")
 
 # ============================
-# 6. MODELO GENERATIVO (GPT-2 español)
+# 5. MODELO GENERATIVO
 # ============================
 print("Cargando modelo generativo (GPT-2 español)...")
 generator = pipeline(
@@ -81,11 +78,14 @@ generator = pipeline(
 print("Modelo generativo cargado ✅")
 
 # ============================
-# 7. PARÁMETROS Y EXPANSIONES
+# 6. CONSTANTES
 # ============================
 KNOWN_BRANDS = ["toyota", "ford", "hyundai", "kia", "honda", "chevrolet", "chevy"]
 KNOWN_MODELS = ["corolla", "transit", "cr-v", "crv", "tucson", "santa fe", "spin",
                 "edge", "rio", "soul", "veracruz", "element"]
+
+STOP_TOKENS = {"la", "el", "de", "del", "los", "las", "y", "sobre", "que",
+               "una", "un", "al", "en", "para", "por", "con", "lo"}
 
 QUERY_EXPANSIONS = {
     "caja automática": ["transmisión", "transmision", "caja", "automatic"],
@@ -104,11 +104,12 @@ ASPECT_EXPANSIONS = {
     "espacio": ["espacio", "carga", "maletero", "baúl", "baul"],
 }
 
-STOP_TOKENS = {"la", "el", "de", "del", "los", "las", "y", "sobre", "que", "una", "un", "al", "en"}
+# ============================
+# 7. HELPERS
+# ============================
+def clean_token(t: str) -> str:
+    return re.sub(r'^[\?\!\.\,\;\:\¿\¡]+|[\?\!\.\,\;\:\¿\¡]+$', '', t)
 
-# ============================
-# 8. FUNCIONES AUXILIARES
-# ============================
 def expand_query(query: str) -> str:
     q = query.lower()
     extra = []
@@ -153,88 +154,80 @@ def extract_years_from_docs(docs: list[str]) -> list[str]:
     return sorted(list(years))
 
 # ============================
-# 9. RETRIEVAL (ajustado correctamente)
+# 8. RERANK LÉXICO
+# ============================
+def lexical_score(title: str, query_tokens: list[str], brand_tokens: list[str]) -> float:
+    """
+    Score sencillo:
+    +2 por cada token raro que está en el título
+    +1 por cada marca que está en el título
+    + bonus por coincidencia larga
+    """
+    title_low = title.lower()
+    score = 0.0
+    for t in query_tokens:
+        if t and t in title_low:
+            score += 2.0
+    for b in brand_tokens:
+        if b in title_low:
+            score += 1.0
+    # un pequeño bonus por longitud de match del primer token raro
+    if query_tokens:
+        first = query_tokens[0]
+        if first in title_low and len(first) > 4:
+            score += 0.5
+    return score
+
+# ============================
+# 9. RETRIEVAL
 # ============================
 def retrieve_documents(query: str, k: int = 3):
     q_low = query.lower()
-    tokens = [t for t in re.split(r"\s+", q_low) if t]
+    raw_tokens = [t for t in re.split(r"\s+", q_low) if t]
+    tokens = [clean_token(t) for t in raw_tokens if clean_token(t)]
 
+    # separar marcas y "tokens raros"
     brands_in_query = [b for b in KNOWN_BRANDS if b in q_low]
-    models_in_query = [m for m in KNOWN_MODELS if m in q_low]
-
-    candidate_tokens = [
+    rare_tokens = [
         t for t in tokens
         if t not in STOP_TOKENS
         and t not in KNOWN_BRANDS
-        and t not in KNOWN_MODELS
     ]
 
-    # 1️⃣ Marca + token candidato (ej: ford aspire)
-    if brands_in_query and candidate_tokens:
-        mask = pd.Series([True] * len(df))
-        mask &= df["Vehicle_Title"].str.lower().str.contains("|".join(brands_in_query))
-        for tok in candidate_tokens:
-            tok_mask = (
-                df["Vehicle_Title"].str.lower().str.contains(tok)
-                | df["review_es"].str.lower().str.contains(tok)
-            )
-            mask &= tok_mask
-
-        df_sub = df[mask]
-        if not df_sub.empty:
-            df_sub = df_sub.reset_index(drop=True)
-            sub_docs = [
-                f"Vehículo: {row['Vehicle_Title']}. Comentario del usuario: {row['review_es']}. ¿Lo recomienda?: {row['Recommend']}."
-                for _, row in df_sub.iterrows()
-            ]
-            sub_emb = embedding_model.encode(sub_docs, show_progress_bar=False)
-            sub_emb = np.array(sub_emb, dtype="float32")
-
-            sub_index = faiss.IndexFlatL2(dimension)
-            sub_index.add(sub_emb)
-
-            expanded_query = expand_query(query)
-            q_emb = np.array(embedding_model.encode([expanded_query]), dtype="float32")
-            dists, idxs = sub_index.search(q_emb, min(k, len(df_sub)))
-
-            retrieved = [sub_docs[i] for i in idxs[0]]
-
-            # 🔍 seguridad: si FAISS no devuelve el modelo correcto, filtramos manualmente
-            joined = " ".join(retrieved).lower()
-            if not any(tok in joined for tok in candidate_tokens):
-                retrieved = [d for d in sub_docs if any(tok in d.lower() for tok in candidate_tokens)]
-
-            return retrieved or sub_docs[:k]
-
-    # 2️⃣ Marca o modelo conocidos
-    if brands_in_query or models_in_query:
-        mask = pd.Series([True] * len(df))
-        if brands_in_query:
-            mask &= df["Vehicle_Title"].str.lower().str.contains("|".join(brands_in_query))
-        if models_in_query:
-            mask &= df["Vehicle_Title"].str.lower().str.contains("|".join(models_in_query))
-        df_sub = df[mask]
-        if not df_sub.empty:
-            df_sub = df_sub.reset_index(drop=True)
-            sub_docs = [
-                f"Vehículo: {row['Vehicle_Title']}. Comentario del usuario: {row['review_es']}. ¿Lo recomienda?: {row['Recommend']}."
-                for _, row in df_sub.iterrows()
-            ]
-            sub_emb = embedding_model.encode(sub_docs, show_progress_bar=False)
-            sub_emb = np.array(sub_emb, dtype="float32")
-            sub_index = faiss.IndexFlatL2(dimension)
-            sub_index.add(sub_emb)
-
-            expanded_query = expand_query(query)
-            q_emb = np.array(embedding_model.encode([expanded_query]), dtype="float32")
-            dists, idxs = sub_index.search(q_emb, min(k, len(df_sub)))
-            return [sub_docs[i] for i in idxs[0]]
-
-    # 3️⃣ Búsqueda global de respaldo
+    # 1) búsqueda vectorial global (traemos bastante para rerankear)
     expanded_query = expand_query(query)
     q_emb = np.array(embedding_model.encode([expanded_query]), dtype="float32")
-    dists, idxs = index.search(q_emb, k)
-    return [documents[i] for i in idxs[0]]
+    # traemos 40 candidatos por las dudas
+    dists, idxs = index.search(q_emb, 40)
+    faiss_candidates = idxs[0].tolist()
+
+    # 2) candidatos léxicos: filas cuyo título contiene algún token raro
+    lexical_candidates = set()
+    if rare_tokens:
+        title_series = df["Vehicle_Title"].str.lower()
+        for rt in rare_tokens:
+            mask = title_series.str.contains(rt)
+            lexical_candidates.update(df[mask].index.tolist())
+
+    # 3) union de candidatos
+    all_candidates = set(faiss_candidates).union(lexical_candidates)
+
+    # 4) rerank
+    scored = []
+    for idx_doc in all_candidates:
+        title = df.loc[idx_doc, "Vehicle_Title"]
+        score = lexical_score(title, rare_tokens, brands_in_query)
+        scored.append((score, idx_doc))
+
+    # orden descendente por score
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    # si nadie tuvo score >0, nos quedamos con los 3 de FAISS nomás
+    if not scored or scored[0][0] == 0:
+        return [documents[i] for i in faiss_candidates[:k]]
+
+    top_indices = [idx for _, idx in scored[:k]]
+    return [documents[i] for i in top_indices]
 
 # ============================
 # 10. REDACTOR HUMANO
@@ -277,7 +270,7 @@ def build_human_answer(query: str, docs: list[str]) -> str:
     return resp.strip()
 
 # ============================
-# 11. GENERACIÓN HÍBRIDA
+# 11. GENERACIÓN
 # ============================
 def generate_answer(query: str, retrieved_docs: list[str]) -> str:
     if not retrieved_docs:
@@ -346,6 +339,7 @@ def answer_pipeline(query: str) -> str:
             )
 
     return generate_answer(query, docs)
+
 
 
 
