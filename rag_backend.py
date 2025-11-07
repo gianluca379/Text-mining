@@ -11,7 +11,7 @@ from transformers import pipeline
 warnings.filterwarnings("ignore")
 
 # ============================
-# 1. RUTAS
+# 1. RUTAS RELATIVAS (para GitHub / Streamlit Cloud)
 # ============================
 DATA_PATH = "Car_Reviews_español.xlsx"
 EMB_PATH = "car_reviews_embeddings.npy"
@@ -33,19 +33,19 @@ documents = [
     for _, row in df.iterrows()
 ]
 
-# para saber si un token existe en algún título
-ALL_TITLES_LOW = df["Vehicle_Title"].str.lower()
-
 print(f"✅ Dataset cargado: {len(df)} reseñas")
 
 # ============================
-# 3. EMBEDDINGS
+# 3. MODELO DE EMBEDDINGS
 # ============================
 print("Cargando modelo de SentenceTransformer - all-MiniLM-L6-v2 ...")
 embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 dimension = 384
 print("Modelo cargado ✅")
 
+# ============================
+# 4. EMBEDDINGS (cargar o generar)
+# ============================
 if os.path.exists(EMB_PATH):
     doc_embeddings = np.load(EMB_PATH)
     print(f"Embeddings cargados desde {EMB_PATH}")
@@ -63,14 +63,14 @@ doc_embeddings = np.array(doc_embeddings, dtype="float32")
 print(f"Forma de los embeddings: {doc_embeddings.shape}")
 
 # ============================
-# 4. FAISS
+# 5. FAISS INDEX
 # ============================
 index = faiss.IndexFlatL2(dimension)
 index.add(doc_embeddings)
 print(f"Índice FAISS creado con {index.ntotal} vectores.")
 
 # ============================
-# 5. MODELO GENERATIVO
+# 6. MODELO GENERATIVO (GPT-2 español)
 # ============================
 print("Cargando modelo generativo (GPT-2 español)...")
 generator = pipeline(
@@ -81,30 +81,20 @@ generator = pipeline(
 print("Modelo generativo cargado ✅")
 
 # ============================
-# 6. CONSTANTES
+# 7. PARÁMETROS Y EXPANSIONES
 # ============================
 KNOWN_BRANDS = ["toyota", "ford", "hyundai", "kia", "honda", "chevrolet", "chevy"]
-
-STOP_TOKENS = {
-    "la", "el", "de", "del", "los", "las", "y", "sobre", "que",
-    "una", "un", "al", "en", "para", "por", "con", "lo"
-}
+KNOWN_MODELS = ["corolla", "transit", "cr-v", "crv", "tucson", "santa fe", "spin",
+                "edge", "rio", "soul", "veracruz", "element"]
 
 QUERY_EXPANSIONS = {
     "caja automática": ["transmisión", "transmision", "caja", "automatic"],
-    "consumo": ["consumo", "mpg", "gasolina", "rendimiento de gasolina",
-                "economía de combustible", "economia de combustible",
-                "consumo de combustible", "combustible", "kilometraje", "millas", "km"],
+    "consumo": ["consumo", "mpg", "gasolina", "rendimiento de gasolina", "economía de combustible"],
     "ruido": ["ruido", "ruidoso", "cabina ruidosa", "sound", "noise"],
 }
 
 ASPECT_EXPANSIONS = {
-    # 👇 acá agrego "combustible" que te faltaba
-    "consumo": [
-        "consumo", "gasolina", "rendimiento", "mpg", "fuel",
-        "economía", "economia", "combustible", "consumo de combustible",
-        "economía de combustible", "kilometraje", "millas", "km"
-    ],
+    "consumo": ["consumo", "gasolina", "rendimiento", "mpg", "fuel", "economía", "economia"],
     "ruido": ["ruido", "ruidoso", "sonido", "cabina ruidosa"],
     "transmisión": ["transmisión", "transmision", "caja", "caja automática", "automatic"],
     "suspensión": ["suspensión", "suspension"],
@@ -115,11 +105,8 @@ ASPECT_EXPANSIONS = {
 }
 
 # ============================
-# 7. HELPERS
+# 8. FUNCIONES AUXILIARES
 # ============================
-def clean_token(t: str) -> str:
-    return re.sub(r'^[\?\!\.\,\;\:\¿\¡]+|[\?\!\.\,\;\:\¿\¡]+$', '', t)
-
 def expand_query(query: str) -> str:
     q = query.lower()
     extra = []
@@ -144,21 +131,15 @@ def get_aspect_terms(query: str):
     return list(terms)
 
 def filter_docs_by_aspect(retrieved_docs: list[str], query: str) -> list[str]:
-    """
-    Filtro NO estricto: si hay frases del aspecto, uso solo esas.
-    Si no hay, devuelvo los docs originales (para que no quede vacío).
-    """
     aspect_terms = get_aspect_terms(query)
     if not aspect_terms:
         return retrieved_docs
-
     filtered_chunks = []
     for doc in retrieved_docs:
         sentences = re.split(r"[\.!?]\s+", doc)
         for sent in sentences:
             if any(term in sent.lower() for term in aspect_terms):
                 filtered_chunks.append(sent.strip() + ".")
-
     return filtered_chunks or retrieved_docs
 
 def extract_years_from_docs(docs: list[str]) -> list[str]:
@@ -170,70 +151,45 @@ def extract_years_from_docs(docs: list[str]) -> list[str]:
     return sorted(list(years))
 
 # ============================
-# 8. RETRIEVAL
+# 9. RETRIEVAL
 # ============================
 def retrieve_documents(query: str, k: int = 3):
     q_low = query.lower()
-    raw_tokens = [t for t in re.split(r"\s+", q_low) if t]
-    tokens = [clean_token(t) for t in raw_tokens if clean_token(t)]
-
     brands_in_query = [b for b in KNOWN_BRANDS if b in q_low]
+    models_in_query = [m for m in KNOWN_MODELS if m in q_low]
 
-    # tokens de la pregunta que de verdad existen en títulos
-    model_like_tokens = []
-    for t in tokens:
-        if t in STOP_TOKENS:
-            continue
-        if t in KNOWN_BRANDS:
-            continue
-        if ALL_TITLES_LOW.str.contains(t).any():
-            model_like_tokens.append(t)
-
-    # 1) marca + token existente en títulos (ej. ford + aspire)
-    if brands_in_query and model_like_tokens:
+    if brands_in_query or models_in_query:
         mask = pd.Series([True] * len(df))
-        mask &= df["Vehicle_Title"].str.lower().str.contains("|".join(brands_in_query))
-        for tok in model_like_tokens:
-            mask &= df["Vehicle_Title"].str.lower().str.contains(tok)
-
+        if brands_in_query:
+            mask = mask & df["Vehicle_Title"].str.lower().str.contains("|".join(brands_in_query))
+        if models_in_query:
+            mask = mask & df["Vehicle_Title"].str.lower().str.contains("|".join(models_in_query))
         df_sub = df[mask]
         if not df_sub.empty:
-            df_sub = df_sub.reset_index(drop=True)
-            sub_docs = [
-                f"Vehículo: {row['Vehicle_Title']}. Comentario del usuario: {row['review_es']}. ¿Lo recomienda?: {row['Recommend']}."
-                for _, row in df_sub.iterrows()
-            ]
-            return sub_docs[:k]
-
-    # 2) solo marca (pero reordeno con faiss)
-    if brands_in_query:
-        mask = df["Vehicle_Title"].str.lower().str.contains("|".join(brands_in_query))
-        df_sub = df[mask]
-        if not df_sub.empty:
-            df_sub = df_sub.reset_index(drop=True)
-            sub_docs = [
-                f"Vehículo: {row['Vehicle_Title']}. Comentario del usuario: {row['review_es']}. ¿Lo recomienda?: {row['Recommend']}."
-                for _, row in df_sub.iterrows()
-            ]
-
-            sub_emb = embedding_model.encode(sub_docs, show_progress_bar=False)
-            sub_emb = np.array(sub_emb, dtype="float32")
+            sub_indices = df_sub.index.to_list()
+            sub_embeddings = doc_embeddings[sub_indices]
             sub_index = faiss.IndexFlatL2(dimension)
-            sub_index.add(sub_emb)
+            sub_index.add(sub_embeddings)
 
             expanded_query = expand_query(query)
-            q_emb = np.array(embedding_model.encode([expanded_query]), dtype="float32")
-            dists, idxs = sub_index.search(q_emb, min(k, len(df_sub)))
-            return [sub_docs[i] for i in idxs[0]]
+            q_emb = embedding_model.encode([expanded_query])
+            q_emb = np.array(q_emb, dtype="float32")
+            dists, idxs = sub_index.search(q_emb, min(k, len(sub_indices)))
 
-    # 3) fallback global
+            retrieved = []
+            for pos in idxs[0]:
+                real_idx = sub_indices[pos]
+                retrieved.append(documents[real_idx])
+            return retrieved
+
     expanded_query = expand_query(query)
-    q_emb = np.array(embedding_model.encode([expanded_query]), dtype="float32")
+    q_emb = embedding_model.encode([expanded_query])
+    q_emb = np.array(q_emb, dtype="float32")
     dists, idxs = index.search(q_emb, k)
     return [documents[i] for i in idxs[0]]
 
 # ============================
-# 9. REDACTOR HUMANO
+# 10. REDACTOR HUMANO
 # ============================
 def build_human_answer(query: str, docs: list[str]) -> str:
     aspect_terms = get_aspect_terms(query)
@@ -257,14 +213,8 @@ def build_human_answer(query: str, docs: list[str]) -> str:
         elif "¿Lo recomienda?: No" in d:
             negativos += 1
 
-    # intento filtrar por aspecto pero sin dejar vacío
     if aspect_terms:
-        comentarios_aspecto = [c for c in comentarios if any(t in c.lower() for t in aspect_terms)]
-        if comentarios_aspecto:
-            comentarios = comentarios_aspecto
-
-    if not comentarios:
-        return "No tengo información suficiente para responder a esa pregunta."
+        comentarios = [c for c in comentarios if any(t in c.lower() for t in aspect_terms)] or comentarios
 
     resp = "Esto es lo que dicen las reseñas encontradas:\n\n"
     if vehiculos:
@@ -279,7 +229,7 @@ def build_human_answer(query: str, docs: list[str]) -> str:
     return resp.strip()
 
 # ============================
-# 10. GENERACIÓN
+# 11. GENERACIÓN HÍBRIDA (mejorada)
 # ============================
 def generate_answer(query: str, retrieved_docs: list[str]) -> str:
     if not retrieved_docs:
@@ -303,7 +253,7 @@ def generate_answer(query: str, retrieved_docs: list[str]) -> str:
     try:
         out = generator(
             prompt,
-            max_new_tokens=350,
+            max_new_tokens=350,  # mayor longitud
             num_return_sequences=1,
             temperature=0.4,
             top_p=0.9,
@@ -313,48 +263,24 @@ def generate_answer(query: str, retrieved_docs: list[str]) -> str:
     except Exception:
         model_text = ""
 
-    # si el modelo se pone a repetir el prompt, cae al modo humano
-    if ("Tienes opiniones de usuarios" in model_text) or (len(model_text.strip()) < 15):
-        return build_human_answer(query, retrieved_docs)
-
     for token in ["Pregunta:", "Opiniones:", "Contexto:"]:
         if token in model_text:
             model_text = model_text.split(token)[0]
     model_text = " ".join(line.strip() for line in model_text.splitlines() if line.strip())
 
+    truncated = not model_text.endswith((".", "?", "!", "”", "\"")) or len(model_text.split()) < 20
+    too_similar = "comentario del usuario" in model_text.lower()
+
+    if truncated or too_similar:
+        return build_human_answer(query, retrieved_docs)
+
     return model_text.strip()
 
 # ============================
-# 11. PIPELINE FINAL
+# 12. PIPELINE FINAL
 # ============================
 def answer_pipeline(query: str) -> str:
-    # recuperar algo
     docs = retrieve_documents(query, k=3)
-
-    # detectar modelo exacto del primer doc
-    modelo_detectado = None
-    if docs and docs[0].startswith("Vehículo:"):
-        modelo_detectado = (
-            docs[0].split("Comentario del usuario:")[0]
-            .replace("Vehículo:", "")
-            .strip()
-            .lower()
-        )
-
-    # si hay modelo exacto, traigo TODAS las reseñas de ese modelo
-    if modelo_detectado:
-        mask_all = df["Vehicle_Title"].str.lower().str.contains(re.escape(modelo_detectado))
-        df_all = df[mask_all]
-        if not df_all.empty:
-            all_docs_same_model = [
-                f"Vehículo: {row['Vehicle_Title']}. Comentario del usuario: {row['review_es']}. ¿Lo recomienda?: {row['Recommend']}."
-                for _, row in df_all.iterrows()
-            ]
-            # filtro NO estricto (si no hay consumo, no queda vacío)
-            aspect_docs = filter_docs_by_aspect(all_docs_same_model, query)
-            return generate_answer(query, aspect_docs)
-
-    # manejo de años igual que antes
     year = has_query_year(query)
     ctx = "\n\n".join(docs)
     if year and not context_has_year(ctx, year):
@@ -371,14 +297,5 @@ def answer_pipeline(query: str) -> str:
                 "Solo hay comentarios de otros años o modelos."
             )
 
-    # caso general
-    aspect_docs = filter_docs_by_aspect(docs, query)
-    return generate_answer(query, aspect_docs)
-
-
-
-
-
-
-
+    return generate_answer(query, docs)
 
