@@ -139,10 +139,6 @@ def get_aspect_terms(query: str):
     return list(terms)
 
 def filter_docs_by_aspect(retrieved_docs: list[str], query: str, strict: bool = False) -> list[str]:
-    """
-    strict=True => si no hay ninguna frase del aspecto, devolvemos lista vacía.
-    strict=False => si no hay coincidencias, devolvemos los docs originales.
-    """
     aspect_terms = get_aspect_terms(query)
     if not aspect_terms:
         return retrieved_docs
@@ -256,7 +252,9 @@ def build_human_answer(query: str, docs: list[str]) -> str:
             negativos += 1
 
     if aspect_terms:
-        comentarios = [c for c in comentarios if any(t in c.lower() for t in aspect_terms)]
+        comentarios_aspecto = [c for c in comentarios if any(t in c.lower() for t in aspect_terms)]
+        if comentarios_aspecto:
+            comentarios = comentarios_aspecto
 
     if not comentarios:
         return "No tengo información suficiente para responder a esa pregunta."
@@ -276,7 +274,7 @@ def build_human_answer(query: str, docs: list[str]) -> str:
 # ============================
 # 10. GENERACIÓN
 # ============================
-def generate_answer(query: str, retrieved_docs: list[str]) -> str:
+def generate_answer(query: str, retrieved_docs: list[str], note: str = "") -> str:
     if not retrieved_docs:
         return "No tengo información suficiente para responder a esa pregunta."
 
@@ -284,7 +282,12 @@ def generate_answer(query: str, retrieved_docs: list[str]) -> str:
     short_docs = [str(doc)[:max_chars] for doc in retrieved_docs]
     context = "\n\n".join(f"[{i+1}] {doc}" for i, doc in enumerate(short_docs))
 
+    prefix = ""
+    if note:
+        prefix = note + "\n\n"
+
     prompt = (
+        prefix +
         "Tienes opiniones de usuarios sobre vehículos (en español).\n"
         "Resume de manera natural y completa lo que dicen los usuarios sobre el tema consultado.\n"
         "No repitas el texto exacto, sintetiza y escribe una respuesta terminada con punto final.\n"
@@ -325,10 +328,10 @@ def generate_answer(query: str, retrieved_docs: list[str]) -> str:
 # 11. PIPELINE FINAL
 # ============================
 def answer_pipeline(query: str) -> str:
-    # recuperar algunos docs
+    # recuperar 3
     docs = retrieve_documents(query, k=3)
 
-    # detectar modelo exacto del primer doc
+    # detectar modelo exacto
     modelo_detectado = None
     if docs and docs[0].startswith("Vehículo:"):
         modelo_detectado = (
@@ -338,7 +341,7 @@ def answer_pipeline(query: str) -> str:
             .lower()
         )
 
-    # si hay modelo exacto, traigo TODAS las reseñas de ese modelo
+    # si hay modelo exacto, traigo todas las reseñas de ese modelo
     if modelo_detectado:
         mask_all = df["Vehicle_Title"].str.lower().str.contains(re.escape(modelo_detectado))
         df_all = df[mask_all]
@@ -347,11 +350,16 @@ def answer_pipeline(query: str) -> str:
                 f"Vehículo: {row['Vehicle_Title']}. Comentario del usuario: {row['review_es']}. ¿Lo recomienda?: {row['Recommend']}."
                 for _, row in df_all.iterrows()
             ]
-            # 👇 ahora sí: filtrado estricto por aspecto
-            aspect_docs = filter_docs_by_aspect(all_docs_same_model, query, strict=True)
-            if not aspect_docs:
-                return "No tengo información suficiente para responder a esa pregunta."
-            return generate_answer(query, aspect_docs)
+            # 1) intento filtro estricto
+            strict_docs = filter_docs_by_aspect(all_docs_same_model, query, strict=True)
+            if strict_docs:
+                return generate_answer(query, strict_docs)
+            # 2) fallback suave: te aviso
+            return generate_answer(
+                query,
+                all_docs_same_model,
+                note="No encontré reseñas que hablen específicamente de ese aspecto, pero esto es lo que comentan los usuarios sobre ese modelo."
+            )
 
     # manejo de años
     year = has_query_year(query)
@@ -370,11 +378,17 @@ def answer_pipeline(query: str) -> str:
                 "Solo hay comentarios de otros años o modelos."
             )
 
-    # caso general: también filtramos estricto
-    aspect_docs = filter_docs_by_aspect(docs, query, strict=True)
-    if not aspect_docs:
-        return "No tengo información suficiente para responder a esa pregunta."
-    return generate_answer(query, aspect_docs)
+    # caso general: intento estricto y luego suave
+    strict_docs = filter_docs_by_aspect(docs, query, strict=True)
+    if strict_docs:
+        return generate_answer(query, strict_docs)
+
+    return generate_answer(
+        query,
+        docs,
+        note="No encontré reseñas que hablen específicamente de ese aspecto, pero esto es lo que comentan los usuarios."
+    )
+
 
 
 
