@@ -8,9 +8,15 @@ from sentence_transformers import SentenceTransformer
 
 warnings.filterwarnings("ignore")
 
+# =====================================================
+# 1. RUTAS
+# =====================================================
 DATA_PATH = "Car_Reviews_español.xlsx"
 EMB_PATH = "car_reviews_embeddings.npy"
 
+# =====================================================
+# 2. CARGA DE DATOS
+# =====================================================
 if not os.path.exists(DATA_PATH):
     raise FileNotFoundError(
         f"No se encontró el archivo {DATA_PATH}. Subilo al mismo repo/carpeta donde está app.py."
@@ -28,9 +34,12 @@ ALL_TITLES_LOW = df["Vehicle_Title"].str.lower()
 
 print(f"✅ Dataset cargado: {len(df)} reseñas")
 
+# =====================================================
+# 3. EMBEDDINGS + FAISS
+# =====================================================
 print("Cargando modelo de SentenceTransformer - all-MiniLM-L6-v2 ...")
 embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
-dim = 384
+EMB_DIM = 384
 print("Modelo cargado ✅")
 
 if os.path.exists(EMB_PATH):
@@ -48,17 +57,21 @@ else:
 
 doc_embeddings = np.array(doc_embeddings, dtype="float32")
 
-index = faiss.IndexFlatL2(dim)
+index = faiss.IndexFlatL2(EMB_DIM)
 index.add(doc_embeddings)
 print(f"Índice FAISS creado con {index.ntotal} vectores.")
 
-# --------------------- reglas ---------------------
+# =====================================================
+# 4. LISTAS / EXPANSIONES
+# =====================================================
 KNOWN_BRANDS = ["toyota", "ford", "hyundai", "kia", "honda", "chevrolet", "chevy"]
+
 STOP_TOKENS = {
     "la", "el", "de", "del", "los", "las", "y", "sobre", "que",
     "una", "un", "al", "en", "para", "por", "con", "lo"
 }
 
+# palabras que disparan expansión semántica
 QUERY_EXPANSIONS = {
     "caja automática": ["transmisión", "transmision", "caja", "automatic"],
     "consumo": [
@@ -69,10 +82,11 @@ QUERY_EXPANSIONS = {
     "ruido": ["ruido", "ruidoso", "cabina ruidosa", "sound", "noise"],
 }
 
+# aspecto → palabras que tienen que aparecer
 ASPECT_EXPANSIONS = {
     "consumo": [
         "consumo", "combustible", "consumo de combustible",
-        "gasolina", "rendimiento", "mpg", "economía", "economia"
+        "gasolina", "rendimiento", "mpg", "economía", "economia", "millas", "km"
     ],
     "ruido": ["ruido", "ruidoso", "sonido", "cabina ruidosa"],
     "transmisión": ["transmisión", "transmision", "caja", "caja automática", "automatic"],
@@ -81,7 +95,10 @@ ASPECT_EXPANSIONS = {
     "aire": ["aire acondicionado", "ac", "a/c", "climatizador"],
 }
 
-# --------------------- helpers ---------------------
+
+# =====================================================
+# 5. HELPERS
+# =====================================================
 def clean_token(t: str) -> str:
     return re.sub(r'^[\?\!\.\,\;\:\¿\¡]+|[\?\!\.\,\;\:\¿\¡]+$', '', t)
 
@@ -108,6 +125,13 @@ def get_aspect_terms(query: str):
             terms.update(vals)
     return list(terms)
 
+def get_aspect_name(query: str) -> str | None:
+    q = query.lower()
+    for key in ASPECT_EXPANSIONS.keys():
+        if key in q:
+            return key
+    return None
+
 def rerank_by_aspect(docs: list[str], query: str) -> list[str]:
     aspect_terms = get_aspect_terms(query)
     if not aspect_terms:
@@ -118,8 +142,6 @@ def rerank_by_aspect(docs: list[str], query: str) -> list[str]:
         score = sum(low.count(term) for term in aspect_terms)
         scored.append((score, d))
     scored.sort(key=lambda x: x[0], reverse=True)
-    if scored[0][0] == 0:
-        return [d for _, d in scored]
     return [d for _, d in scored]
 
 def filter_docs_by_aspect(retrieved_docs: list[str], query: str) -> list[str]:
@@ -132,7 +154,8 @@ def filter_docs_by_aspect(retrieved_docs: list[str], query: str) -> list[str]:
         for sent in sentences:
             if any(term in sent.lower() for term in aspect_terms):
                 filtered.append(sent.strip() + ".")
-    return filtered or retrieved_docs
+    return filtered
+
 
 def extract_years_from_docs(docs: list[str]) -> list[str]:
     years = set()
@@ -142,13 +165,19 @@ def extract_years_from_docs(docs: list[str]) -> list[str]:
             years.add(y)
     return sorted(list(years))
 
-# --------------------- retrieval ---------------------
+
+# =====================================================
+# 6. RETRIEVAL
+# =====================================================
 def retrieve_documents(query: str, k: int = 3):
+    """
+    Recupera k documentos lo más alineados posible con la marca/modelo.
+    """
     q_low = query.lower()
     tokens = [clean_token(t) for t in q_low.split() if clean_token(t)]
     brands_in_query = [b for b in KNOWN_BRANDS if b in q_low]
 
-    # tokens que sí existen en títulos
+    # tokens que también existen en los títulos
     model_like_tokens = []
     for t in tokens:
         if t in STOP_TOKENS or t in KNOWN_BRANDS:
@@ -156,7 +185,7 @@ def retrieve_documents(query: str, k: int = 3):
         if ALL_TITLES_LOW.str.contains(t).any():
             model_like_tokens.append(t)
 
-    # marca + modelo detectado
+    # marca + modelo (más preciso)
     if brands_in_query and model_like_tokens:
         mask = pd.Series([True] * len(df))
         mask &= df["Vehicle_Title"].str.lower().str.contains("|".join(brands_in_query))
@@ -181,23 +210,25 @@ def retrieve_documents(query: str, k: int = 3):
             ]
             sub_emb = embedding_model.encode(sub_docs, show_progress_bar=False)
             sub_emb = np.array(sub_emb, dtype="float32")
-            sub_index = faiss.IndexFlatL2(dim)
+            sub_index = faiss.IndexFlatL2(EMB_DIM)
             sub_index.add(sub_emb)
 
             expanded_query = expand_query(query)
             q_emb = np.array(embedding_model.encode([expanded_query]), dtype="float32")
-            dists, idxs = sub_index.search(q_emb, min(k, len(sub_docs)))
+            _, idxs = sub_index.search(q_emb, min(k, len(sub_docs)))
             return [sub_docs[i] for i in idxs[0]]
 
     # global
     expanded_query = expand_query(query)
     q_emb = np.array(embedding_model.encode([expanded_query]), dtype="float32")
-    dists, idxs = index.search(q_emb, k)
+    _, idxs = index.search(q_emb, k)
     return [documents[i] for i in idxs[0]]
 
-# --------------------- respuesta ---------------------
+
+# =====================================================
+# 7. CONSTRUCTOR DE RESPUESTA
+# =====================================================
 def build_human_answer(query: str, docs: list[str]) -> str:
-    aspect_terms = get_aspect_terms(query)
     vehiculos = set()
     comentarios = []
     pos = 0
@@ -220,16 +251,6 @@ def build_human_answer(query: str, docs: list[str]) -> str:
         elif "¿Lo recomienda?: No" in d:
             neg += 1
 
-    if aspect_terms:
-        comentarios_aspecto = [
-            c for c in comentarios if any(t in c.lower() for t in aspect_terms)
-        ]
-        if comentarios_aspecto:
-            comentarios = comentarios_aspecto
-
-    if not comentarios:
-        return "No tengo información suficiente para responder a esa pregunta."
-
     resp = "Esto es lo que dicen las reseñas encontradas:\n\n"
     if vehiculos:
         resp += "Modelos con opiniones: " + ", ".join(vehiculos) + ".\n"
@@ -241,12 +262,20 @@ def build_human_answer(query: str, docs: list[str]) -> str:
         resp += f"- {c}\n"
     return resp.strip()
 
-# --------------------- pipeline ---------------------
+
+# =====================================================
+# 8. PIPELINE FINAL
+# =====================================================
 def answer_pipeline(query: str, k: int = 3) -> str:
-    # RECUPERA con el mismo k que vea el usuario
-    docs = retrieve_documents(query, k=k)
+    """
+    k = lo que pide el usuario (lo que se muestra).
+    internamente vamos a recuperar más (8) para poder filtrar por consumo/ruido/etc.
+    """
+    internal_k = max(k, 8)  # 👈 acá está la mejora
+    docs = retrieve_documents(query, k=internal_k)
     docs = rerank_by_aspect(docs, query)
 
+    # si pidió año concreto y no hay
     year = has_query_year(query)
     ctx = "\n\n".join(docs)
     if year and not context_has_year(ctx, year):
@@ -263,9 +292,24 @@ def answer_pipeline(query: str, k: int = 3) -> str:
                 "Solo hay comentarios de otros años o modelos."
             )
 
+    # filtrar por aspecto
     aspect_docs = filter_docs_by_aspect(docs, query)
-    return build_human_answer(query, aspect_docs)
+    aspect_name = get_aspect_name(query)
 
-# para la UI
+    if get_aspect_terms(query) and not aspect_docs:
+        # había un aspecto (consumo/ruido/motor) pero las reseñas que llegaron no hablan de eso
+        return (
+            f"No encontré comentarios específicos sobre **{aspect_name}** para este modelo en las reseñas recuperadas.\n"
+            "Pero sí hablan de otras cosas (comodidad, espacio, manejo, etc.). Podés probar con otra pregunta o ampliar el modelo/año."
+        )
+
+    # quedate solo con lo que el usuario pidió ver
+    final_docs = aspect_docs if aspect_docs else docs
+    final_docs = final_docs[:k]
+
+    return build_human_answer(query, final_docs)
+
+
 def retrieve_for_ui(query: str, k: int = 3):
+    # lo dejamos simple para la app
     return retrieve_documents(query, k=k)
