@@ -1,18 +1,15 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[ ]:
-
-
 import streamlit as st
 import importlib
 
 st.set_page_config(page_title="RAG de reseñas de autos", layout="wide")
 
-st.title("🚗 Asistente RAG sobre reseñas de vehículos")
+st.title("🚗 Asistente sobre reseñas de vehículos")
 st.write(
-    "Escribí una pregunta sobre las reseñas del Excel (consumo, ruido, transmisión, etc.). "
-    "La app intentará cargar el motor de RAG."
+    "Escribí una pregunta sobre las reseñas de un modelo.La pregunta puede ser generica o especifica en relación al consumo, ruido, transmisión, espacio o algun otro dato de tu interes. "
+    "La app usa el mismo número de documentos para responder y para mostrarte cuáles usó."
 )
 
 @st.cache_resource
@@ -30,9 +27,13 @@ def load_backend():
 
 backend = load_backend()
 
-# UI principal
-query = st.text_area("Pregunta:", value="¿Qué dicen sobre el consumo de la Ford Transit?", height=100)
-k_docs = st.slider("Cantidad de documentos a mostrar", 1, 5, 2, 1)
+# --- UI ---
+query = st.text_area(
+    "Pregunta:",
+    value="¿Qué dicen sobre el consumo de la Ford Transit?",
+    height=100
+)
+k_docs = st.slider("Cantidad de documentos a usar/mostrar", 1, 5, 2, 1)
 
 if st.button("Consultar"):
     if isinstance(backend, Exception):
@@ -46,13 +47,14 @@ if st.button("Consultar"):
     else:
         if query.strip():
             with st.spinner("Buscando y generando respuesta..."):
-                # usamos las funciones que ya tenés en tu archivo bueno
-                answer = backend.answer_pipeline(query)
+                # 👇 ahora le pasamos el mismo k que elegiste en el slider
+                answer = backend.answer_pipeline(query, k=k_docs)
 
                 st.subheader("🟢 Respuesta")
                 st.write(answer)
 
                 st.subheader("📄 Documentos recuperados")
+                # y mostramos exactamente los mismos
                 docs = backend.retrieve_documents(query, k=k_docs)
                 for i, d in enumerate(docs, start=1):
                     with st.expander(f"Documento {i}"):
@@ -65,5 +67,3 @@ else:
             "⚠️ El motor RAG todavía no se pudo cargar. "
             "Cuando lo ejecutes desde el entorno correcto, podés apretar 'Consultar' y va a funcionar."
         )
-
-

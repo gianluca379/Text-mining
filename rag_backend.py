@@ -8,15 +8,9 @@ from sentence_transformers import SentenceTransformer
 
 warnings.filterwarnings("ignore")
 
-# =====================================================
-# 1. RUTAS
-# =====================================================
 DATA_PATH = "Car_Reviews_español.xlsx"
 EMB_PATH = "car_reviews_embeddings.npy"
 
-# =====================================================
-# 2. CARGA DE DATOS
-# =====================================================
 if not os.path.exists(DATA_PATH):
     raise FileNotFoundError(
         f"No se encontró el archivo {DATA_PATH}. Subilo al mismo repo/carpeta donde está app.py."
@@ -34,9 +28,6 @@ ALL_TITLES_LOW = df["Vehicle_Title"].str.lower()
 
 print(f"✅ Dataset cargado: {len(df)} reseñas")
 
-# =====================================================
-# 3. EMBEDDINGS + FAISS
-# =====================================================
 print("Cargando modelo de SentenceTransformer - all-MiniLM-L6-v2 ...")
 embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 dim = 384
@@ -61,12 +52,8 @@ index = faiss.IndexFlatL2(dim)
 index.add(doc_embeddings)
 print(f"Índice FAISS creado con {index.ntotal} vectores.")
 
-
-# =====================================================
-# 4. LISTAS / EXPANSIONES
-# =====================================================
+# --------------------- reglas ---------------------
 KNOWN_BRANDS = ["toyota", "ford", "hyundai", "kia", "honda", "chevrolet", "chevy"]
-
 STOP_TOKENS = {
     "la", "el", "de", "del", "los", "las", "y", "sobre", "que",
     "una", "un", "al", "en", "para", "por", "con", "lo"
@@ -94,10 +81,7 @@ ASPECT_EXPANSIONS = {
     "aire": ["aire acondicionado", "ac", "a/c", "climatizador"],
 }
 
-
-# =====================================================
-# 5. HELPERS
-# =====================================================
+# --------------------- helpers ---------------------
 def clean_token(t: str) -> str:
     return re.sub(r'^[\?\!\.\,\;\:\¿\¡]+|[\?\!\.\,\;\:\¿\¡]+$', '', t)
 
@@ -124,39 +108,31 @@ def get_aspect_terms(query: str):
             terms.update(vals)
     return list(terms)
 
-
 def rerank_by_aspect(docs: list[str], query: str) -> list[str]:
-    """Reordena los docs poniendo arriba los que más mencionan el aspecto."""
     aspect_terms = get_aspect_terms(query)
     if not aspect_terms:
         return docs
-
     scored = []
     for d in docs:
-        text_low = d.lower()
-        score = sum(text_low.count(term) for term in aspect_terms)
+        low = d.lower()
+        score = sum(low.count(term) for term in aspect_terms)
         scored.append((score, d))
-
     scored.sort(key=lambda x: x[0], reverse=True)
     if scored[0][0] == 0:
         return [d for _, d in scored]
     return [d for _, d in scored]
 
-
 def filter_docs_by_aspect(retrieved_docs: list[str], query: str) -> list[str]:
     aspect_terms = get_aspect_terms(query)
     if not aspect_terms:
         return retrieved_docs
-
     filtered = []
     for doc in retrieved_docs:
         sentences = re.split(r"[\.!?]\s+", doc)
         for sent in sentences:
             if any(term in sent.lower() for term in aspect_terms):
                 filtered.append(sent.strip() + ".")
-
     return filtered or retrieved_docs
-
 
 def extract_years_from_docs(docs: list[str]) -> list[str]:
     years = set()
@@ -166,15 +142,13 @@ def extract_years_from_docs(docs: list[str]) -> list[str]:
             years.add(y)
     return sorted(list(years))
 
-
-# =====================================================
-# 6. RETRIEVAL
-# =====================================================
+# --------------------- retrieval ---------------------
 def retrieve_documents(query: str, k: int = 3):
     q_low = query.lower()
     tokens = [clean_token(t) for t in q_low.split() if clean_token(t)]
     brands_in_query = [b for b in KNOWN_BRANDS if b in q_low]
 
+    # tokens que sí existen en títulos
     model_like_tokens = []
     for t in tokens:
         if t in STOP_TOKENS or t in KNOWN_BRANDS:
@@ -182,12 +156,12 @@ def retrieve_documents(query: str, k: int = 3):
         if ALL_TITLES_LOW.str.contains(t).any():
             model_like_tokens.append(t)
 
+    # marca + modelo detectado
     if brands_in_query and model_like_tokens:
         mask = pd.Series([True] * len(df))
         mask &= df["Vehicle_Title"].str.lower().str.contains("|".join(brands_in_query))
         for tok in model_like_tokens:
             mask &= df["Vehicle_Title"].str.lower().str.contains(tok)
-
         df_sub = df[mask]
         if not df_sub.empty:
             df_sub = df_sub.reset_index(drop=True)
@@ -196,6 +170,7 @@ def retrieve_documents(query: str, k: int = 3):
                 for _, row in df_sub.head(k).iterrows()
             ]
 
+    # solo marca
     if brands_in_query:
         mask = df["Vehicle_Title"].str.lower().str.contains("|".join(brands_in_query))
         df_sub = df[mask]
@@ -214,15 +189,13 @@ def retrieve_documents(query: str, k: int = 3):
             dists, idxs = sub_index.search(q_emb, min(k, len(sub_docs)))
             return [sub_docs[i] for i in idxs[0]]
 
+    # global
     expanded_query = expand_query(query)
     q_emb = np.array(embedding_model.encode([expanded_query]), dtype="float32")
     dists, idxs = index.search(q_emb, k)
     return [documents[i] for i in idxs[0]]
 
-
-# =====================================================
-# 7. CONSTRUCTOR DE RESPUESTA
-# =====================================================
+# --------------------- respuesta ---------------------
 def build_human_answer(query: str, docs: list[str]) -> str:
     aspect_terms = get_aspect_terms(query)
     vehiculos = set()
@@ -266,15 +239,12 @@ def build_human_answer(query: str, docs: list[str]) -> str:
     resp += "\nPrincipales comentarios:\n"
     for c in comentarios[:3]:
         resp += f"- {c}\n"
-
     return resp.strip()
 
-
-# =====================================================
-# 8. PIPELINE FINAL
-# =====================================================
-def answer_pipeline(query: str) -> str:
-    docs = retrieve_documents(query, k=4)
+# --------------------- pipeline ---------------------
+def answer_pipeline(query: str, k: int = 3) -> str:
+    # RECUPERA con el mismo k que vea el usuario
+    docs = retrieve_documents(query, k=k)
     docs = rerank_by_aspect(docs, query)
 
     year = has_query_year(query)
@@ -296,6 +266,6 @@ def answer_pipeline(query: str) -> str:
     aspect_docs = filter_docs_by_aspect(docs, query)
     return build_human_answer(query, aspect_docs)
 
-
-def retrieve_for_ui(query: str, k: int = 4):
-    return retrieve_documents(query, k)
+# para la UI
+def retrieve_for_ui(query: str, k: int = 3):
+    return retrieve_documents(query, k=k)
