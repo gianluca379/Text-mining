@@ -33,6 +33,9 @@ documents = [
     for _, row in df.iterrows()
 ]
 
+# lo uso para saber rápido si un token existe en algún título
+ALL_TITLES_LOW = df["Vehicle_Title"].str.lower()
+
 print(f"✅ Dataset cargado: {len(df)} reseñas")
 
 # ============================
@@ -84,8 +87,10 @@ KNOWN_BRANDS = ["toyota", "ford", "hyundai", "kia", "honda", "chevrolet", "chevy
 KNOWN_MODELS = ["corolla", "transit", "cr-v", "crv", "tucson", "santa fe", "spin",
                 "edge", "rio", "soul", "veracruz", "element"]
 
-STOP_TOKENS = {"la", "el", "de", "del", "los", "las", "y", "sobre", "que",
-               "una", "un", "al", "en", "para", "por", "con", "lo"}
+STOP_TOKENS = {
+    "la", "el", "de", "del", "los", "las", "y", "sobre", "que",
+    "una", "un", "al", "en", "para", "por", "con", "lo", "los", "las"
+}
 
 QUERY_EXPANSIONS = {
     "caja automática": ["transmisión", "transmision", "caja", "automatic"],
@@ -108,6 +113,7 @@ ASPECT_EXPANSIONS = {
 # 7. HELPERS
 # ============================
 def clean_token(t: str) -> str:
+    # saca ¿ ? ! . , ; :
     return re.sub(r'^[\?\!\.\,\;\:\¿\¡]+|[\?\!\.\,\;\:\¿\¡]+$', '', t)
 
 def expand_query(query: str) -> str:
@@ -154,83 +160,77 @@ def extract_years_from_docs(docs: list[str]) -> list[str]:
     return sorted(list(years))
 
 # ============================
-# 8. RERANK LÉXICO
-# ============================
-def lexical_score(title: str, query_tokens: list[str], brand_tokens: list[str]) -> float:
-    """
-    Score sencillo:
-    +2 por cada token raro que está en el título
-    +1 por cada marca que está en el título
-    + bonus por coincidencia larga
-    """
-    title_low = title.lower()
-    score = 0.0
-    for t in query_tokens:
-        if t and t in title_low:
-            score += 2.0
-    for b in brand_tokens:
-        if b in title_low:
-            score += 1.0
-    # un pequeño bonus por longitud de match del primer token raro
-    if query_tokens:
-        first = query_tokens[0]
-        if first in title_low and len(first) > 4:
-            score += 0.5
-    return score
-
-# ============================
-# 9. RETRIEVAL
+# 8. RETRIEVAL
 # ============================
 def retrieve_documents(query: str, k: int = 3):
+    """
+    - si hay marca en la pregunta (ford) y además alguna palabra de la pregunta
+      aparece en algún Vehicle_Title, filtramos por marca + esas palabras
+      (esto captura "ford aspire")
+    - si solo hay marca, filtramos por marca
+    - si no, FAISS global
+    """
     q_low = query.lower()
     raw_tokens = [t for t in re.split(r"\s+", q_low) if t]
     tokens = [clean_token(t) for t in raw_tokens if clean_token(t)]
 
-    # separar marcas y "tokens raros"
     brands_in_query = [b for b in KNOWN_BRANDS if b in q_low]
-    rare_tokens = [
-        t for t in tokens
-        if t not in STOP_TOKENS
-        and t not in KNOWN_BRANDS
-    ]
 
-    # 1) búsqueda vectorial global (traemos bastante para rerankear)
+    # tokens de la pregunta que de verdad existen en títulos (aspire, connect, cr-v...)
+    model_like_tokens = []
+    for t in tokens:
+        if t in STOP_TOKENS:
+            continue
+        if t in KNOWN_BRANDS:
+            continue
+        if ALL_TITLES_LOW.str.contains(t).any():
+            model_like_tokens.append(t)
+
+    # 1) marca + token existente en títulos
+    if brands_in_query and model_like_tokens:
+        mask = pd.Series([True] * len(df))
+        mask &= df["Vehicle_Title"].str.lower().str.contains("|".join(brands_in_query))
+        for tok in model_like_tokens:
+            mask &= df["Vehicle_Title"].str.lower().str.contains(tok)
+
+        df_sub = df[mask]
+        if not df_sub.empty:
+            df_sub = df_sub.reset_index(drop=True)
+            sub_docs = [
+                f"Vehículo: {row['Vehicle_Title']}. Comentario del usuario: {row['review_es']}. ¿Lo recomienda?: {row['Recommend']}."
+                for _, row in df_sub.iterrows()
+            ]
+            return sub_docs[:k]
+
+    # 2) solo marca
+    if brands_in_query:
+        mask = df["Vehicle_Title"].str.lower().str.contains("|".join(brands_in_query))
+        df_sub = df[mask]
+        if not df_sub.empty:
+            df_sub = df_sub.reset_index(drop=True)
+            sub_docs = [
+                f"Vehículo: {row['Vehicle_Title']}. Comentario del usuario: {row['review_es']}. ¿Lo recomienda?: {row['Recommend']}."
+                for _, row in df_sub.iterrows()
+            ]
+            # faiss dentro del subset para quedarnos con los más parecidos
+            sub_emb = embedding_model.encode(sub_docs, show_progress_bar=False)
+            sub_emb = np.array(sub_emb, dtype="float32")
+            sub_index = faiss.IndexFlatL2(dimension)
+            sub_index.add(sub_emb)
+
+            expanded_query = expand_query(query)
+            q_emb = np.array(embedding_model.encode([expanded_query]), dtype="float32")
+            dists, idxs = sub_index.search(q_emb, min(k, len(df_sub)))
+            return [sub_docs[i] for i in idxs[0]]
+
+    # 3) fallback global
     expanded_query = expand_query(query)
     q_emb = np.array(embedding_model.encode([expanded_query]), dtype="float32")
-    # traemos 40 candidatos por las dudas
-    dists, idxs = index.search(q_emb, 40)
-    faiss_candidates = idxs[0].tolist()
-
-    # 2) candidatos léxicos: filas cuyo título contiene algún token raro
-    lexical_candidates = set()
-    if rare_tokens:
-        title_series = df["Vehicle_Title"].str.lower()
-        for rt in rare_tokens:
-            mask = title_series.str.contains(rt)
-            lexical_candidates.update(df[mask].index.tolist())
-
-    # 3) union de candidatos
-    all_candidates = set(faiss_candidates).union(lexical_candidates)
-
-    # 4) rerank
-    scored = []
-    for idx_doc in all_candidates:
-        title = df.loc[idx_doc, "Vehicle_Title"]
-        score = lexical_score(title, rare_tokens, brands_in_query)
-        scored.append((score, idx_doc))
-
-    # orden descendente por score
-    scored.sort(key=lambda x: x[0], reverse=True)
-
-    # si nadie tuvo score >0, nos quedamos con los 3 de FAISS nomás
-    if not scored or scored[0][0] == 0:
-        return [documents[i] for i in faiss_candidates[:k]]
-
-    top_indices = [idx for _, idx in scored[:k]]
-    return [documents[i] for i in top_indices]
+    dists, idxs = index.search(q_emb, k)
+    return [documents[i] for i in idxs[0]]
 
 # ============================
-# 10. REDACTOR HUMANO
+# 9. REDACTOR HUMANO
 # ============================
 def build_human_answer(query: str, docs: list[str]) -> str:
     aspect_terms = get_aspect_terms(query)
@@ -270,7 +270,7 @@ def build_human_answer(query: str, docs: list[str]) -> str:
     return resp.strip()
 
 # ============================
-# 11. GENERACIÓN
+# 10. GENERACIÓN
 # ============================
 def generate_answer(query: str, retrieved_docs: list[str]) -> str:
     if not retrieved_docs:
@@ -318,10 +318,33 @@ def generate_answer(query: str, retrieved_docs: list[str]) -> str:
     return model_text.strip()
 
 # ============================
-# 12. PIPELINE FINAL
+# 11. PIPELINE FINAL
 # ============================
 def answer_pipeline(query: str) -> str:
+    # 1) recuperamos como siempre (3 docs)
     docs = retrieve_documents(query, k=3)
+
+    # 2) intentamos detectar el modelo exacto del primer doc
+    modelo_detectado = None
+    if docs:
+        first = docs[0]
+        if first.startswith("Vehículo:"):
+            modelo_detectado = first.split("Comentario del usuario:")[0]
+            modelo_detectado = modelo_detectado.replace("Vehículo:", "").strip().lower()
+
+    # 3) si detectamos modelo, traemos TODAS las filas de ese modelo
+    if modelo_detectado:
+        # escapamos por las dudas (si hay parentesis, etc.)
+        mask_all = df["Vehicle_Title"].str.lower().str.contains(re.escape(modelo_detectado))
+        df_all = df[mask_all]
+        if not df_all.empty:
+            all_docs_same_model = [
+                f"Vehículo: {row['Vehicle_Title']}. Comentario del usuario: {row['review_es']}. ¿Lo recomienda?: {row['Recommend']}."
+                for _, row in df_all.iterrows()
+            ]
+            return generate_answer(query, all_docs_same_model)
+
+    # 4) si no hubo modelo exacto, seguimos con la lógica de años
     year = has_query_year(query)
     ctx = "\n\n".join(docs)
     if year and not context_has_year(ctx, year):
@@ -338,7 +361,9 @@ def answer_pipeline(query: str) -> str:
                 "Solo hay comentarios de otros años o modelos."
             )
 
+    # 5) respuesta normal
     return generate_answer(query, docs)
+
 
 
 
